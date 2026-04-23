@@ -1,11 +1,18 @@
 """
 state_machine.py  -  Core truck state logic.
 
+V2 BUSINESS LOGIC:
+  1. True Cost Search — triggered when truck finishes pickup, moving to delivery
+  2. 30% Safety + 200-Gallon Rule — arrive at delivery with ≥30% fuel
+  3. 40% Low Fuel Trigger — re-verify plan, fire alert with Google Maps link
+  4. Emergency Check — can't reach rec stop? Find next-best immediately
+  5. Wrong Stop / Missed Stop detection with financial loss calculation
+
 STATES:
   HEALTHY          — fuel > 50%, poll every 30 min
-  WATCH            — 35–50%, poll every 15 min
-  CRITICAL_MOVING  — ≤35% and moving, poll every 10 min, alert fired
-  CRITICAL_PARKED  — ≤35% and parked, poll every 60 min, alert fired once
+  WATCH            — 40–50%, poll every 15 min
+  CRITICAL_MOVING  — ≤40% and moving, poll every 10 min, alert fired
+  CRITICAL_PARKED  — ≤40% and parked, poll every 60 min, alert fired once
   IN_YARD          — ignored entirely, poll every 30 min
 
 ALERT RULES (moving):
@@ -38,7 +45,10 @@ from config import (
     DISPATCHER_GROUP_ID,
 )
 from yard_geofence import is_in_yard, get_yard_name
-from truck_stop_finder import find_best_stops, find_best_stops_on_route, calc_savings, get_urgency, find_current_stop, haversine_miles
+from truck_stop_finder import (
+    find_best_stops, find_best_stops_on_route, calc_savings,
+    get_urgency, find_current_stop, haversine_miles,
+)
 from california import (
     should_send_ca_reminder,
     should_reset_ca_reminder,
@@ -52,6 +62,7 @@ from telegram_bot import (
     send_ca_border_reminder,
     send_refueled_alert,
     send_left_yard_low_fuel,
+    send_emergency_alert,
 )
 from database import (
     create_fuel_alert,
@@ -107,6 +118,7 @@ def _new_state(vid, data):
         "assigned_stop_lat":      None,
         "assigned_stop_lng":      None,
         "assigned_stop_net_price": None,
+        "assigned_stop_card_price": None,
         "assignment_time":        None,
         "in_yard":                False,
         "yard_name":              None,
@@ -125,6 +137,7 @@ def _new_state(vid, data):
         "missed_stop_name":       None,
         "missed_stop_card_price": None,
         "missed_stop_net_price":  None,
+        "low_fuel_flagged":       False,
     }
 
 
@@ -135,6 +148,7 @@ def _clear_alert(state):
     state["assigned_stop_lat"]    = None
     state["assigned_stop_lng"]    = None
     state["assigned_stop_net_price"] = None
+    state["assigned_stop_card_price"] = None
     state["assignment_time"]      = None
     state["alert_sent"]           = False
     state["overnight_alert_sent"] = False
@@ -149,6 +163,7 @@ def _clear_alert(state):
     state["missed_stop_name"]       = None
     state["missed_stop_card_price"] = None
     state["missed_stop_net_price"]  = None
+    state["low_fuel_flagged"]       = False
 
 
 def _get_truck_params(vehicle_name: str) -> tuple[float, float]:
@@ -624,6 +639,10 @@ def process_truck(vid, prev_state, current_data, truck_states):
             resolve_alert(state["open_alert_id"])
             _clear_alert(state)
 
+        # Reset 40% flag when fuel recovers above threshold
+        if fuel > FUEL_ALERT_THRESHOLD_PCT:
+            state["low_fuel_flagged"] = False
+
         if fuel > 50:
             state["state"]     = "HEALTHY"
             state["next_poll"] = _next_poll(POLL_INTERVAL_HEALTHY)
@@ -635,6 +654,86 @@ def process_truck(vid, prev_state, current_data, truck_states):
         state["parked_since"] = None
         state["sleeping"]     = False
         return
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # 3b. 40% LOW FUEL TRIGGER — re-verify plan and fire alert
+    #     Per V2 spec: at 40% fuel, re-verify the plan and send Low Fuel Alert
+    #     to Dispatcher and Driver groups with Google Maps link.
+    # ══════════════════════════════════════════════════════════════════════════
+    if fuel <= FUEL_ALERT_THRESHOLD_PCT and not state.get("low_fuel_flagged"):
+        log.info(f"  {vname}: 40% fuel trigger — re-verifying plan")
+        try:
+            from flag_system import flag_low_fuel
+            from database import get_truck_group
+            truck_group = get_truck_group(vname)
+            planned_stop = state.get("assigned_stop_name")
+            flag_low_fuel(
+                vehicle_name=vname,
+                truck_group_id=truck_group,
+                fuel_pct=fuel,
+                truck_lat=lat,
+                truck_lng=lng,
+                planned_stop_name=planned_stop,
+            )
+            state["low_fuel_flagged"] = True
+
+            # Emergency reachability check — can truck reach planned stop?
+            planned_lat = state.get("assigned_stop_lat")
+            planned_lng = state.get("assigned_stop_lng")
+            if planned_lat and planned_lng:
+                range_miles = (fuel / 100) * tank_gal * mpg * 0.85
+                dist_to_planned = haversine_miles(
+                    lat, lng, float(planned_lat), float(planned_lng)
+                )
+                if range_miles < dist_to_planned:
+                    log.warning(
+                        f"  {vname}: EMERGENCY — can't reach planned stop "
+                        f"{state.get('assigned_stop_name')} "
+                        f"({dist_to_planned:.0f}mi away, range={range_miles:.0f}mi)"
+                    )
+                    # Find next-best reachable stop immediately
+                    route = state.get("qm_route")
+                    emergency_radius = min(range_miles * 0.70, 60)
+                    if route:
+                        best, _ = find_best_stops_on_route(
+                            lat, lng, route, fuel, speed, tank_gal, mpg,
+                            truck_heading=heading, max_radius=emergency_radius
+                        )
+                    else:
+                        best, _ = find_best_stops(
+                            lat, lng, heading, speed, fuel, tank_gal, mpg,
+                            max_radius=emergency_radius,
+                            truck_state=state_code or ""
+                        )
+                    if best:
+                        old_name = state.get("assigned_stop_name")
+                        state["assigned_stop_name"] = best["store_name"]
+                        state["assigned_stop_lat"]  = float(best["latitude"])
+                        state["assigned_stop_lng"]  = float(best["longitude"])
+                        state["assigned_stop_card_price"] = best.get("diesel_price")
+                        log.info(
+                            f"  {vname}: reassigned to reachable stop "
+                            f"{best['store_name']} (was {old_name})"
+                        )
+                        # Fire emergency alert with new stop
+                        result = send_emergency_alert(
+                            vehicle_name=vname,
+                            fuel_pct=fuel,
+                            truck_lat=lat,
+                            truck_lng=lng,
+                            heading=heading,
+                            speed_mph=speed,
+                            best_stop=best,
+                            planned_stop_name=old_name,
+                            range_miles=range_miles,
+                        )
+                        if isinstance(result, dict):
+                            state["prev_truck_group"]  = result.get("truck_group")
+                            state["prev_truck_msg_id"] = result.get("truck_msg_id")
+                            state["prev_dispatcher_msg_id"] = result.get("dispatcher_msg_id")
+                        state["alert_sent"] = True
+        except Exception as lfe:
+            log.warning(f"  {vname}: low fuel flag failed: {lfe}")
 
     # ══════════════════════════════════════════════════════════════════════════
     # 4. FUEL IS LOW
@@ -748,6 +847,9 @@ def process_truck(vid, prev_state, current_data, truck_states):
                         from flag_system import flag_wrong_stop
                         from database import get_truck_group
                         truck_group = get_truck_group(vname)
+                        # V2: Pass card prices for financial loss calculation
+                        # Lost Savings = (actual_price - rec_price) × 100 gallons
+                        rec_card_price_val = state.get("assigned_stop_card_price")
                         flag_wrong_stop(
                             vehicle_name=vname,
                             truck_group_id=truck_group,
@@ -755,6 +857,8 @@ def process_truck(vid, prev_state, current_data, truck_states):
                             actual=actual_name,
                             fuel_before=prev_fuel,
                             fuel_after=fuel,
+                            rec_card_price=float(rec_card_price_val) if rec_card_price_val else None,
+                            actual_card_price=card_price if card_price else None,
                         )
                     except Exception as fe:
                         log.warning(f"  {vname}: flag_wrong_stop failed: {fe}")

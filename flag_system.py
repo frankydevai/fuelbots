@@ -1,10 +1,16 @@
 """
 flag_system.py - Flag drivers when they deviate from fuel recommendations.
 
-Three flag types:
-  WRONG_STOP - Driver fueled at a different stop than recommended
-  MISSED_STOP - Driver passed recommended stop without fueling
-  LOW_STOP_STATE - Truck entered a low-stop state below safe fuel level
+Flag types:
+  WRONG_STOP      - Driver fueled at a different stop than recommended
+  MISSED_STOP     - Driver passed recommended stop without fueling
+  LOW_STOP_STATE  - Truck entered a low-stop state below safe fuel level
+  LOW_FUEL        - Truck dropped to 40% fuel (re-verify trigger)
+
+Financial Accountability:
+  Wrong Stop:  Lost Savings = (actual_price - rec_price) × 100 gallons
+  Missed Stop: Estimated loss calculated when driver fuels at next (more expensive) stop
+  All losses logged to driver profile for Weekly Driver Compliance Report.
 
 Flags are sent instantly to driver group + dispatcher group and stored in DB.
 """
@@ -18,6 +24,11 @@ log = logging.getLogger(__name__)
 FLAG_WRONG_STOP = "WRONG_STOP"
 FLAG_MISSED_STOP = "MISSED_STOP"
 FLAG_LOW_STOP_STATE = "LOW_STOP_STATE"
+FLAG_LOW_FUEL = "LOW_FUEL"
+
+# Standard gallon assumption for loss calculations
+# Per spec: "Difference in price × 100 gallons"
+LOSS_CALC_GALLONS = 100
 
 
 def _ensure_flags_table():
@@ -84,17 +95,39 @@ def flag_wrong_stop(
     actual: str,
     fuel_before: float,
     fuel_after: float,
+    rec_card_price: float = None,
+    actual_card_price: float = None,
 ) -> None:
-    """Driver fueled at a different stop than recommended."""
+    """Driver fueled at a different stop than recommended.
+
+    Financial loss = (actual_price - rec_price) × 100 gallons
+    This is charged to the driver's profile for the weekly report.
+    """
+    # Calculate lost savings
+    savings_lost = 0.0
+    loss_line = ""
+    if rec_card_price and actual_card_price and actual_card_price > rec_card_price:
+        price_diff = actual_card_price - rec_card_price
+        savings_lost = round(price_diff * LOSS_CALC_GALLONS, 2)
+        loss_line = (
+            f"\n💸 *Lost Savings: ${savings_lost:.2f}*"
+            f"\n📊 (${actual_card_price:.3f} - ${rec_card_price:.3f}) × {LOSS_CALC_GALLONS} gal"
+        )
+    elif rec_card_price and actual_card_price:
+        loss_line = f"\n✅ No financial loss — actual price was equal or cheaper."
+
     msg = (
         f"🚩 *Flag Alert — Truck {vehicle_name}*\n"
         f"🧾 Type: *Wrong Fuel Stop*\n\n"
-        f"✅ Recommended stop: *{recommended}*\n"
-        f"❌ Actual stop: *{actual}*\n"
-        f"⛽ Fuel: {fuel_before:.0f}% → {fuel_after:.0f}%\n\n"
+        f"✅ Recommended stop: *{recommended}*"
+        + (f" (${rec_card_price:.3f}/gal)" if rec_card_price else "") +
+        f"\n❌ Actual stop: *{actual}*"
+        + (f" (${actual_card_price:.3f}/gal)" if actual_card_price else "") +
+        f"\n⛽ Fuel: {fuel_before:.0f}% → {fuel_after:.0f}%"
+        f"{loss_line}\n\n"
         f"⚠️ Driver did not follow the fuel recommendation."
     )
-    save_flag(
+    flag_id = save_flag(
         vehicle_name,
         FLAG_WRONG_STOP,
         msg,
@@ -102,6 +135,18 @@ def flag_wrong_stop(
         actual_stop=actual,
         fuel_pct=fuel_before,
     )
+
+    # Save financial loss to flag record
+    if savings_lost > 0:
+        try:
+            with db_cursor() as cur:
+                cur.execute(
+                    "UPDATE driver_flags SET savings_lost = %s WHERE id = %s",
+                    (savings_lost, flag_id)
+                )
+        except Exception as e:
+            log.warning(f"Failed to save wrong stop loss: {e}")
+
     send_flag(vehicle_name, FLAG_WRONG_STOP, msg, truck_group_id)
 
 
@@ -175,8 +220,47 @@ def flag_low_stop_state(
     send_flag(vehicle_name, FLAG_LOW_STOP_STATE, msg, truck_group_id)
 
 
+def flag_low_fuel(
+    vehicle_name: str,
+    truck_group_id: str,
+    fuel_pct: float,
+    truck_lat: float,
+    truck_lng: float,
+    planned_stop_name: str = None,
+) -> None:
+    """Truck dropped to 40% fuel — re-verify plan and fire alert.
+
+    This is the active monitoring trigger per V2 spec.
+    Logged to DB for the weekly performance report.
+    """
+    maps_url = f"https://maps.google.com/?q={truck_lat:.6f},{truck_lng:.6f}"
+    plan_line = ""
+    if planned_stop_name:
+        plan_line = f"\n📍 Planned stop: *{planned_stop_name}*"
+
+    msg = (
+        f"⚠️ *Low Fuel Alert — Truck {vehicle_name}*\n"
+        f"⛽ Fuel: *{fuel_pct:.0f}%*\n"
+        f"📍 [Truck Location]({maps_url})"
+        f"\n🌐 `{truck_lat:.5f}, {truck_lng:.5f}`"
+        f"{plan_line}\n\n"
+        f"🔄 Re-verifying fuel plan..."
+    )
+    save_flag(
+        vehicle_name,
+        FLAG_LOW_FUEL,
+        msg,
+        fuel_pct=fuel_pct,
+    )
+    send_flag(vehicle_name, FLAG_LOW_FUEL, msg, truck_group_id)
+
+
 def get_flags_summary(days: int = 7) -> dict:
-    """Get flag summary for weekly report."""
+    """Get flag summary for weekly report.
+
+    Returns all flag types: Wrong Stop, Missed Stop, Low Fuel Events,
+    Low-Stop State entries, and total savings lost.
+    """
     _ensure_flags_table()
     from datetime import datetime, timezone, timedelta
 
@@ -185,7 +269,8 @@ def get_flags_summary(days: int = 7) -> dict:
         cur.execute(
             """
             SELECT flag_type, COUNT(*) as cnt,
-                   array_agg(vehicle_name ORDER BY flagged_at DESC) as trucks
+                   array_agg(vehicle_name ORDER BY flagged_at DESC) as trucks,
+                   COALESCE(SUM(savings_lost), 0) as total_lost
             FROM driver_flags
             WHERE flagged_at >= %s
             GROUP BY flag_type
@@ -200,5 +285,21 @@ def get_flags_summary(days: int = 7) -> dict:
         result[row["flag_type"]] = {
             "count": row["cnt"],
             "trucks": list(set(row["trucks"]))[:5],
+            "total_lost": float(row["total_lost"] or 0),
         }
     return result
+
+
+def get_total_savings_lost(days: int = 7) -> float:
+    """Get total confirmed financial losses from all flags."""
+    _ensure_flags_table()
+    from datetime import datetime, timezone, timedelta
+
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+    with db_cursor() as cur:
+        cur.execute(
+            "SELECT COALESCE(SUM(savings_lost), 0) as total "
+            "FROM driver_flags WHERE flagged_at >= %s AND savings_lost > 0",
+            (since,),
+        )
+        return float(cur.fetchone()["total"] or 0)

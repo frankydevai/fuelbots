@@ -21,7 +21,7 @@ from border_strategy import (
     analyze_route_borders, build_border_strategy,
     format_border_warnings, AVOID_FUEL_STATES, LOW_STOP_STATES
 )
-from config import DEFAULT_TANK_GAL, DEFAULT_MPG, IFTA_HOME_STATE
+from config import DEFAULT_TANK_GAL, DEFAULT_MPG, IFTA_HOME_STATE, FULL_TANK_FILL_GAL, DEADHEAD_RESERVE_MILES, SAFETY_RESERVE
 
 log = logging.getLogger(__name__)
 
@@ -265,7 +265,20 @@ def plan_route_briefing(
 
     # Can truck complete without stopping?
     range_miles = _reachable_miles(current_fuel_pct, tank_gal, mpg)
-    can_complete = range_miles >= total_dist
+
+    # V2: Calculate arrival fuel target (30% reserve + 150mi deadhead)
+    dest_state = dest.get("state", "").upper() if dest else ""
+    try:
+        from price_updater import calculate_arrival_fuel_target
+        arrival_info = calculate_arrival_fuel_target(dest_state, tank_gal, mpg)
+        arrival_target_pct = arrival_info["target_pct"]
+    except Exception:
+        arrival_target_pct = SAFETY_RESERVE * 100 + (DEADHEAD_RESERVE_MILES / mpg / tank_gal) * 100
+
+    # Must arrive with at least arrival_target_pct fuel
+    fuel_consumed_pct = (total_dist / mpg / tank_gal) * 100
+    fuel_at_arrival = current_fuel_pct - fuel_consumed_pct
+    can_complete = fuel_at_arrival >= arrival_target_pct
 
     if can_complete:
         return {
@@ -291,7 +304,7 @@ def plan_route_briefing(
     stop_number = 1
     emergency_mode = current_fuel_pct <= 10
     critical_mode  = current_fuel_pct <= 20
-    FILL_TO        = 100.0
+    FILL_TO        = 100.0  # V2: always fill to 100% (Full Tank Fill = 200 gal)
 
     if emergency_mode:
         warnings.append(
@@ -389,8 +402,9 @@ def plan_route_briefing(
         dist_to_stop = s["dist_from_truck"]
         miles_to_stop = dist_to_stop - sim_dist
         fuel_arrival = sim_fuel - (miles_to_stop / mpg / tank_gal) * 100
+        # V2: Full Tank Fill (200 Gallons) at every recommended stop
         gal_to_fill = round((FILL_TO - max(fuel_arrival, 5)) / 100 * tank_gal, 1)
-        gal_to_fill = max(min(gal_to_fill, tank_gal * 0.95), 15)  # min 15 gal
+        gal_to_fill = max(min(gal_to_fill, FULL_TANK_FILL_GAL), 15)  # 200 gal max, 15 gal min
 
         card_cost = round(s["card_price"] * gal_to_fill, 2)
         net_cost  = round(s["net_price"]  * gal_to_fill, 2)
@@ -559,6 +573,7 @@ def format_route_briefing(plan: dict, truck_name: str,
         f"*Route Fuel Plan - Truck {truck_name}*",
         f"Trip #{trip}  |  {o_city} -> {d_city}",
         f"{plan['total_distance']:.0f} miles  |  {fuel_pct:.0f}% fuel  |  {mpg:.1f} MPG",
+        f"⛽ *Fill Instruction: Full Tank Fill (200 Gallons)*",
         "",
     ]
 

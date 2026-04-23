@@ -91,14 +91,16 @@ DATABASE_URL        = _require("DATABASE_URL")
 
 # ── Fuel alerting ─────────────────────────────────────────────────────────────
 
-FUEL_ALERT_THRESHOLD_PCT = _float("FUEL_ALERT_THRESHOLD_PCT", 35.0)
+FUEL_ALERT_THRESHOLD_PCT = _float("FUEL_ALERT_THRESHOLD_PCT", 40.0)
 
 
 # ── Truck defaults ────────────────────────────────────────────────────────────
 
-DEFAULT_TANK_GAL = _float("DEFAULT_TANK_GAL", 200.0)
-DEFAULT_MPG      = _float("DEFAULT_MPG",      6.5)
-SAFETY_RESERVE   = _float("SAFETY_RESERVE",   0.30)
+DEFAULT_TANK_GAL       = _float("DEFAULT_TANK_GAL",       200.0)
+DEFAULT_MPG            = _float("DEFAULT_MPG",            6.5)
+SAFETY_RESERVE         = _float("SAFETY_RESERVE",         0.30)
+DEADHEAD_RESERVE_MILES = _float("DEADHEAD_RESERVE_MILES", 150.0)
+FULL_TANK_FILL_GAL     = _float("FULL_TANK_FILL_GAL",     200.0)
 
 
 # ── Fuel stop search ──────────────────────────────────────────────────────────

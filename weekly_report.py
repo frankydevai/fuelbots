@@ -441,6 +441,7 @@ def build_report(summary, compliance, flags, ifta_by_state, output_path):
         "Wrong Stop":     RED,
         "Missed Stop":    AMBER,
         "Low-Stop State": "FF8800",
+        "Low Fuel":       BLUE,
     }
     for ri, f in enumerate(flags, 3):
         ft_color = flag_colors.get(f["type"], WHITE)

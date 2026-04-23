@@ -1392,8 +1392,11 @@ def _handle_truckstats(text: str, chat_id: str) -> None:
 
 
 def _handle_flags(text: str, chat_id: str) -> None:
-    """/flags [truck] — show recent driver flags"""
-    from flag_system import get_flags_summary, FLAG_WRONG_STOP, FLAG_MISSED_STOP, FLAG_LOW_STOP_STATE
+    """/flags [truck] — show recent driver flags with financial impact"""
+    from flag_system import (
+        get_flags_summary, get_total_savings_lost,
+        FLAG_WRONG_STOP, FLAG_MISSED_STOP, FLAG_LOW_STOP_STATE, FLAG_LOW_FUEL,
+    )
     from database import db_cursor
     from datetime import datetime, timezone, timedelta
 
@@ -1404,7 +1407,7 @@ def _handle_flags(text: str, chat_id: str) -> None:
         truck_num = parts[1].strip()
         with db_cursor() as cur:
             cur.execute("""
-                SELECT flag_type, details, flagged_at
+                SELECT flag_type, details, flagged_at, savings_lost
                 FROM driver_flags
                 WHERE vehicle_name = %s AND flagged_at >= %s
                 ORDER BY flagged_at DESC LIMIT 10
@@ -1413,11 +1416,16 @@ def _handle_flags(text: str, chat_id: str) -> None:
         if not rows:
             _send_to(chat_id, f"✅ No flags for truck *{truck_num}* in last 7 days.")
             return
+        total_lost = sum(float(r.get("savings_lost") or 0) for r in rows)
         lines = [f"🚩 *Flags — Truck {truck_num}* (last 7 days)\n"]
         for r in rows:
             dt = r["flagged_at"].strftime("%b %d %H:%M")
             ft = r["flag_type"].replace("_", " ").title()
-            lines.append(f"🚩 {dt} — *{ft}*")
+            loss = float(r.get("savings_lost") or 0)
+            loss_str = f" — *${loss:.2f} lost*" if loss > 0 else ""
+            lines.append(f"🚩 {dt} — *{ft}*{loss_str}")
+        if total_lost > 0:
+            lines.append(f"\n💸 *Total savings lost: ${total_lost:.2f}*")
         _send_to(chat_id, "\n".join(lines))
     else:
         summary = get_flags_summary(days=7)
@@ -1429,12 +1437,19 @@ def _handle_flags(text: str, chat_id: str) -> None:
             FLAG_WRONG_STOP:    "⛽ Wrong Stop",
             FLAG_MISSED_STOP:   "🛣 Missed Stop",
             FLAG_LOW_STOP_STATE: "⚠️ Low-Stop State",
+            FLAG_LOW_FUEL:       "🔋 Low Fuel Event",
         }
         for flag_type, data in summary.items():
             label  = icons.get(flag_type, flag_type)
             trucks = ", ".join(data["trucks"][:5])
-            lines.append(f"*{label}:* {data['count']} times")
+            loss_str = f" — *${data.get('total_lost', 0):.2f} lost*" if data.get('total_lost', 0) > 0 else ""
+            lines.append(f"*{label}:* {data['count']} times{loss_str}")
             lines.append(f"   Trucks: {trucks}")
+
+        total_lost = get_total_savings_lost(days=7)
+        if total_lost > 0:
+            lines.append(f"\n💸 *Total fleet savings lost: ${total_lost:.2f}*")
+
         lines.append("\nType `/flags <truck#>` for per-truck detail.")
         _send_to(chat_id, "\n".join(lines))
 
@@ -1542,6 +1557,33 @@ def send_weekly_savings_report() -> None:
         f"",
         f"💰 *Total Diesel Savings: ${total_savings:,.2f}*",
     ]
+
+    # ── V2 Flag System Summary ──────────────────────────────────────────────
+    try:
+        from flag_system import get_flags_summary, get_total_savings_lost
+        flag_summary = get_flags_summary(days=7)
+        total_lost = get_total_savings_lost(days=7)
+
+        if flag_summary or total_lost > 0:
+            lines += [
+                "",
+                "─────────────────────────────",
+                "🚩 *Driver Accountability Flags:*",
+            ]
+            flag_icons = {
+                "WRONG_STOP":    "⛽ Wrong Stop",
+                "MISSED_STOP":   "🛣 Missed Stop",
+                "LOW_FUEL":      "🔋 Low Fuel Event",
+                "LOW_STOP_STATE": "⚠️ Low-Stop State",
+            }
+            for flag_type, data in flag_summary.items():
+                label = flag_icons.get(flag_type, flag_type)
+                loss_str = f" — *${data.get('total_lost', 0):.2f} lost*" if data.get('total_lost', 0) > 0 else ""
+                lines.append(f"   {label}: *{data['count']}*{loss_str}")
+            if total_lost > 0:
+                lines.append(f"   💸 *Total savings lost to flags: ${total_lost:.2f}*")
+    except Exception as fe:
+        log.warning(f"Weekly report flag summary failed: {fe}")
 
     # Top trucks
     if top_trucks:
