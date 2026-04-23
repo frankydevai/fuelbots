@@ -499,8 +499,13 @@ def find_best_stops_on_route(
     if max_radius is not None:
         search_radius = min(search_radius, float(max_radius))
 
+    dist_to_final_dest = haversine_miles(truck_lat, truck_lng, dest_lat, dest_lng)
+    is_end_of_trip = dist_to_final_dest < 15.0
+
+    if is_end_of_trip:
+        search_radius = 30.0  # simple 30-mile radial search at end of trip
+
     # Build route segments: truck → each upcoming stop → destination
-    # This follows the actual highway path instead of a straight line
     route_stops = route.get("stops", [])
     upcoming_waypoints = []
     for s in route_stops:
@@ -549,37 +554,42 @@ def find_best_stops_on_route(
         adiff_from_truck     = angle_diff(truck_heading, stop_bear_from_truck)
         along_from_truck     = dist * math.cos(math.radians(adiff_from_truck))
 
-        # Stop is behind the truck — skip regardless of route
-        if along_from_truck <= 0:
-            continue
+        if not is_end_of_trip:
+            # Stop is behind the truck — skip regardless of route
+            if along_from_truck <= 0:
+                continue
 
-        # Stop is too far off heading — skip unless critical
-        if adiff_from_truck > 90 and urgency not in ("CRITICAL", "EMERGENCY"):
-            continue
+            # Stop is too far off heading — skip unless critical
+            if adiff_from_truck > 90 and urgency not in ("CRITICAL", "EMERGENCY"):
+                continue
 
         # Check if stop is near ANY segment of the route
         on_route = False
         min_cross = float("inf")
         prev_lat, prev_lng = truck_lat, truck_lng
 
-        for wp_lat, wp_lng in upcoming_waypoints:
-            seg_heading  = bearing(prev_lat, prev_lng, wp_lat, wp_lng)
-            seg_dist     = haversine_miles(prev_lat, prev_lng, wp_lat, wp_lng)
-            stop_bearing = bearing(prev_lat, prev_lng, slat, slng)
-            adiff        = angle_diff(seg_heading, stop_bearing)
-            dist_from_seg_start = haversine_miles(prev_lat, prev_lng, slat, slng)
-            along = dist_from_seg_start * math.cos(math.radians(adiff))
-            cross = abs(dist_from_seg_start * math.sin(math.radians(adiff)))
+        if is_end_of_trip:
+            on_route = True
+            min_cross = dist
+        else:
+            for wp_lat, wp_lng in upcoming_waypoints:
+                seg_heading  = bearing(prev_lat, prev_lng, wp_lat, wp_lng)
+                seg_dist     = haversine_miles(prev_lat, prev_lng, wp_lat, wp_lng)
+                stop_bearing = bearing(prev_lat, prev_lng, slat, slng)
+                adiff        = angle_diff(seg_heading, stop_bearing)
+                dist_from_seg_start = haversine_miles(prev_lat, prev_lng, slat, slng)
+                along = dist_from_seg_start * math.cos(math.radians(adiff))
+                cross = abs(dist_from_seg_start * math.sin(math.radians(adiff)))
 
-            if along > 0 and adiff <= 90 and cross <= 50.0 and along <= seg_dist * 1.1:
-                on_route = True
-                min_cross = min(min_cross, cross)
-                break
+                if along > 0 and adiff <= 90 and cross <= 50.0 and along <= seg_dist * 1.1:
+                    on_route = True
+                    min_cross = min(min_cross, cross)
+                    break
 
-            prev_lat, prev_lng = wp_lat, wp_lng
+                prev_lat, prev_lng = wp_lat, wp_lng
 
-        if not on_route:
-            continue
+            if not on_route:
+                continue
 
         seen_ids.add(stop_id)
         price    = stop.get("diesel_price") or 0
@@ -604,10 +614,9 @@ def find_best_stops_on_route(
 
     candidates.sort(key=lambda s: s["_score"])
 
-    # Safety cap: don't recommend stop more than 2x nearest distance
-    nearest      = min(candidates, key=lambda s: s["distance_miles"])
-    max_rec_dist = max(nearest["distance_miles"] * 2.0, 60.0)
-    filtered     = [c for c in candidates if c["distance_miles"] <= max_rec_dist] or candidates
+    # Re-sort candidates by score.
+    # We rely on max_range and search_radius entirely now for True Cost searching
+    filtered = candidates
     filtered.sort(key=lambda s: s["_score"])
 
     best  = filtered[0]
