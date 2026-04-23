@@ -661,6 +661,8 @@ def format_route_briefing(plan: dict, truck_name: str,
 
         if s.get("retail_price"):
             lines.append(f"💰 Retail: ${s['retail_price']:.3f}/gal")
+        if s.get("card_price"):
+            lines.append(f"💳 Card:   *${s['card_price']:.3f}/gal*")
         
         lines.append("")
         

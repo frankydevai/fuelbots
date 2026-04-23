@@ -235,25 +235,20 @@ def _build_route(trip: dict, truck_number: str) -> dict | None:
             "appt":         s.get("appointment_date", ""),
         })
 
-    # Origin = first pickup with coords
+    # Origin = first pickup stop with coords
     origin = next((s for s in stops if s["pickup"] and s["lat"]), None)
 
-    # Destination depends on status
-    if status == "dispatched":
-        dest = next((s for s in stops if s["pickup"] and s["lat"]), None)
+    # Destination = LAST delivery (non-pickup) stop with coords.
+    # This is always the final delivery regardless of trip status.
+    delivery_stops = [s for s in stops if not s["pickup"] and s["lat"]]
+    if delivery_stops:
+        dest = delivery_stops[-1]
     else:
-        # in_transit — next stop after first pickup
-        passed_first = False
-        dest = None
-        for s in stops:
-            if s["pickup"] and not passed_first:
-                passed_first = True
-                continue
-            if s["lat"]:
-                dest = s
-                break
-        if not dest:
-            dest = next((s for s in reversed(stops) if s["lat"]), None)
+        # Fallback: last stop with coords that isn't the origin
+        dest = next(
+            (s for s in reversed(stops) if s["lat"] and s is not origin),
+            None,
+        )
 
     if not origin or not dest:
         log.warning(f"Trip {trip.get('trip_num')}: no coords for origin/dest")
