@@ -252,8 +252,9 @@ def flag_low_fuel(
         msg,
         fuel_pct=fuel_pct,
     )
-    # Only send to dispatcher group, not the driver
-    send_flag(vehicle_name, FLAG_LOW_FUEL, msg, truck_group_id=None)
+    # Silently save to database for the weekly report.
+    # We do NOT send this to Telegram to avoid spamming dispatch/drivers.
+    # send_flag(vehicle_name, FLAG_LOW_FUEL, msg, truck_group_id=None)
 
 
 def get_flags_summary(days: int = 7) -> dict:
