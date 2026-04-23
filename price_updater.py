@@ -375,6 +375,7 @@ def calculate_arrival_fuel_target(
     # Cap at 95% — truck can't arrive completely full
     target_pct = min(target_pct, 95.0)
 
+    return {
         "target_pct": round(target_pct, 1),
         "reserve_gal": round(reserve_gal, 1),
         "reserve_pct": round(reserve_pct, 1),

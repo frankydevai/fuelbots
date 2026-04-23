@@ -77,6 +77,41 @@ def _nearest_priced_stop(
     return nearest
 
 
+def _cheapest_priced_stop_near(
+    lat: float,
+    lng: float,
+    all_stops: list[dict],
+    max_miles: float,
+) -> dict | None:
+    """Fallback: cheapest stop within max_miles of a point (e.g. destination)."""
+    cheapest = None
+    best_price = float('inf')
+    for stop in all_stops:
+        price = stop.get("diesel_price")
+        if not price:
+            continue
+        try:
+            dist = haversine_miles(
+                lat, lng,
+                float(stop["latitude"]), float(stop["longitude"])
+            )
+            if dist <= max_miles:
+                net = net_price_after_ifta(float(price), stop.get("state", ""))
+                if net < best_price:
+                    best_price = net
+                    cheapest = {
+                        **stop,
+                        "dist_from_truck": round(dist, 1), # overridden later
+                        "card_price": round(float(price), 3),
+                        "retail_price": stop.get("retail_price"),
+                        "net_price": round(net, 4),
+                        "ifta_rate": round(get_ifta_rate(stop.get("state", "")), 3),
+                    }
+        except Exception:
+            pass
+    return cheapest
+
+
 def _can_continue_after_stop(
     stop: dict,
     total_dist: float,
@@ -353,7 +388,10 @@ def plan_route_briefing(
         range_now = _reachable_miles(sim_fuel, tank_gal, mpg)
         max_reach_dist = sim_dist + range_now
 
-        if max_reach_dist >= total_dist:
+        fuel_consumed_pct = ((total_dist - sim_dist) / mpg / tank_gal) * 100
+        fuel_at_arrival = sim_fuel - fuel_consumed_pct
+
+        if max_reach_dist >= total_dist and fuel_at_arrival >= arrival_target_pct:
             break
 
         reachable_candidates = [
@@ -368,7 +406,16 @@ def plan_route_briefing(
         ]
 
         if not viable_candidates:
-            if (emergency_mode or critical_mode) and reachable_candidates:
+            if max_reach_dist >= total_dist and fuel_at_arrival < arrival_target_pct:
+                # Radial fallback around destination to meet arrival target
+                s = _cheapest_priced_stop_near(dest["lat"], dest["lng"], all_stops, 30.0)
+                if s:
+                    s["dist_from_truck"] = total_dist
+                    warnings.append("Post-delivery radial search fallback used to hit target fuel %.")
+                else:
+                    warnings.append(f"No reachable fuel stop found near destination to hit arrival target.")
+                    break
+            elif (emergency_mode or critical_mode) and reachable_candidates:
                 s = min(reachable_candidates, key=lambda stop: stop["dist_from_truck"])
             elif emergency_mode and sim_dist == 0.0:
                 s = _nearest_priced_stop(
