@@ -252,7 +252,8 @@ def flag_low_fuel(
         msg,
         fuel_pct=fuel_pct,
     )
-    send_flag(vehicle_name, FLAG_LOW_FUEL, msg, truck_group_id)
+    # Only send to dispatcher group, not the driver
+    send_flag(vehicle_name, FLAG_LOW_FUEL, msg, truck_group_id=None)
 
 
 def get_flags_summary(days: int = 7) -> dict:

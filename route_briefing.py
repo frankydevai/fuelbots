@@ -273,7 +273,7 @@ def plan_route_briefing(
         arrival_info = calculate_arrival_fuel_target(dest_state, tank_gal, mpg)
         arrival_target_pct = arrival_info["target_pct"]
     except Exception:
-        arrival_target_pct = SAFETY_RESERVE * 100 + (DEADHEAD_RESERVE_MILES / mpg / tank_gal) * 100
+        arrival_target_pct = SAFETY_RESERVE * 100
 
     # Must arrive with at least arrival_target_pct fuel
     fuel_consumed_pct = (total_dist / mpg / tank_gal) * 100
@@ -580,8 +580,7 @@ def format_route_briefing(plan: dict, truck_name: str,
     truck_lat = plan.get("truck_lat")
     truck_lng = plan.get("truck_lng")
     if truck_lat is not None and truck_lng is not None:
-        lines.append(f"Current location: {truck_lat:.4f}, {truck_lng:.4f}")
-        lines.append(f"https://maps.google.com/?q={truck_lat},{truck_lng}")
+        lines.append(f"Current location: [{truck_lat:.4f}, {truck_lng:.4f}](https://maps.google.com/?q={truck_lat},{truck_lng})")
         lines.append("")
 
     if plan.get("emergency_mode"):
@@ -592,11 +591,8 @@ def format_route_briefing(plan: dict, truck_name: str,
         lines.append("")
 
     if plan["can_complete_without_stop"]:
-        lines += [
-            "*Truck has enough fuel for the full route.*",
-            "No fuel stops needed.",
-        ]
-        return "\n".join(lines)
+        # User requested to suppress alerts if no fuel stops are needed
+        return ""
 
     if not plan["planned_stops"]:
         lines.append("No fuel stop recommendation is available for this route yet.")
@@ -618,7 +614,9 @@ def format_route_briefing(plan: dict, truck_name: str,
 
         if s.get("retail_price"):
             lines.append(f"💰 Retail: ${s['retail_price']:.3f}/gal")
-        lines.append(f"💳 Card:   *${s['card_price']:.3f}/gal*")
+        
+        lines.append("")
+        
         if plan.get("ifta_enabled"):
             if abs(s["total_net_cost"] - s["total_card_cost"]) >= 1:
                 lines.append(
@@ -638,9 +636,9 @@ def format_route_briefing(plan: dict, truck_name: str,
             )
             lines.append("📋 IFTA adjustment is off because `IFTA_HOME_STATE` is not set.")
 
-        if s.get("maps_url"):
-            lines.append(f"🗺 [Open in Google Maps]({s['maps_url']})")
         lines.append("")
+        if s.get("maps_url"):
+            lines.append(f"🗺️ [Open in Google Maps]({s['maps_url']})")
 
     # Note about remaining stops
     if total > 1:

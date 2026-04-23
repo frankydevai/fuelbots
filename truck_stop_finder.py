@@ -429,22 +429,13 @@ def find_best_stops(
     # Sort by score (true cost for price-matters, distance for critical/emergency)
     candidates.sort(key=lambda s: s["_score"])
 
-    # Safety check: never recommend a stop more than 2x the nearest stop's distance.
-    # e.g. if Pilot is 25mi away, don't send driver 137mi to save $0.31/gal
-    nearest = min(candidates, key=lambda s: s["distance_miles"])
-    nearest_dist = nearest["distance_miles"]
-    max_recommend_dist = max(nearest_dist * 2.0, 60.0)  # at least 60mi window
-
-    # Filter out stops beyond the max recommend distance, keep at least 1
-    filtered = [c for c in candidates if c["distance_miles"] <= max_recommend_dist]
-    if not filtered:
-        filtered = candidates  # fallback: keep all if filter removes everything
-
-    # Re-sort filtered by score. For advisory/warning fuel levels, avoid
-    # recommending the very first nearby stop just because it is slightly cheaper.
+    # Re-sort candidates by score.
+    # For advisory/warning fuel levels, avoid recommending the very first nearby stop
+    # just because it is slightly cheaper, but DO allow searching the full max range.
+    filtered = candidates
     filtered.sort(key=lambda s: s["_score"])
     if price_matters:
-        late_distance_floor = max(30.0, min(max_recommend_dist * 0.5, max_range * 0.6))
+        late_distance_floor = min(30.0, max_range * 0.5)
         late_candidates = [
             s for s in filtered
             if s.get("_ahead", True) and s["distance_miles"] >= late_distance_floor
@@ -503,8 +494,8 @@ def find_best_stops_on_route(
     max_range  = reachable_miles(fuel_pct, tank_gal, mpg)
     truck_in_ca = False  # will be set by caller if needed
 
-    # Search radius based on fuel level
-    search_radius = 100.0 if fuel_pct >= 30 else 50.0
+    # V2: Search radius should be the entire reachable range for True Cost search
+    search_radius = max_range
     if max_radius is not None:
         search_radius = min(search_radius, float(max_radius))
 

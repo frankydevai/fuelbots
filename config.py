@@ -91,7 +91,7 @@ DATABASE_URL        = _require("DATABASE_URL")
 
 # ── Fuel alerting ─────────────────────────────────────────────────────────────
 
-FUEL_ALERT_THRESHOLD_PCT = _float("FUEL_ALERT_THRESHOLD_PCT", 40.0)
+FUEL_ALERT_THRESHOLD_PCT = _float("FUEL_ALERT_THRESHOLD_PCT", 30.0)
 
 
 # ── Truck defaults ────────────────────────────────────────────────────────────

@@ -361,11 +361,8 @@ def calculate_arrival_fuel_target(
     reserve_pct = SAFETY_RESERVE * 100  # 30%
     reserve_gal = tank_gal * SAFETY_RESERVE
 
-    # 150 miles deadhead
-    deadhead_gal = DEADHEAD_RESERVE_MILES / mpg
-    deadhead_pct = (deadhead_gal / tank_gal) * 100
-
-    target_pct = reserve_pct + deadhead_pct
+    # 30% target for arrival at delivery
+    target_pct = reserve_pct
 
     # If destination is inside an expensive state, add extra buffer
     dest_upper = dest_state.upper().strip()
@@ -378,15 +375,11 @@ def calculate_arrival_fuel_target(
     # Cap at 95% — truck can't arrive completely full
     target_pct = min(target_pct, 95.0)
 
-    return {
         "target_pct": round(target_pct, 1),
-        "deadhead_gal": round(deadhead_gal, 1),
         "reserve_gal": round(reserve_gal, 1),
         "reserve_pct": round(reserve_pct, 1),
-        "deadhead_pct": round(deadhead_pct, 1),
         "reason": (
-            f"30% reserve ({reserve_pct:.0f}%) + "
-            f"{DEADHEAD_RESERVE_MILES:.0f}mi deadhead ({deadhead_pct:.0f}%)"
+            f"30% arrival reserve ({reserve_pct:.0f}%)"
             f"{extra_reason}"
         ),
     }

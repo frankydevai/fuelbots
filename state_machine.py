@@ -288,10 +288,8 @@ def process_truck(vid, prev_state, current_data, truck_states):
             )
             msg = format_route_briefing(plan, vname, route, fuel, mpg)
 
-            if not msg:
-                log.warning(f"  {vname}: route briefing produced no message; will retry next cycle")
-            else:
-                # Send to driver group + dispatcher
+            # Send to driver group + dispatcher only if a message was generated
+            if msg:
                 # Delete previous route briefing first (only briefings, not flags/emergencies)
                 truck_group = get_truck_group(vname)
                 prev_briefing_truck      = state.get("prev_briefing_truck_msg_id")
@@ -318,42 +316,44 @@ def process_truck(vid, prev_state, current_data, truck_states):
                     if truck_group:
                         _send_to(truck_group, bw_msg)
                     _send_to_dispatcher(bw_msg)
+            else:
+                log.info(f"  {vname}: route briefing not needed (no message generated)")
 
-                # Store planned stops so missed-stop detection works
-                if plan.get("planned_stops"):
-                    next_stop = plan["planned_stops"][0]
-                    state["assigned_stop_name"]       = next_stop["store_name"]
-                    state["assigned_stop_lat"]        = next_stop.get("latitude") or next_stop.get("lat")
-                    state["assigned_stop_lng"]        = next_stop.get("longitude") or next_stop.get("lng")
-                    state["assigned_stop_dist"]       = next_stop.get("dist_from_truck", 0)
-                    state["assigned_stop_card_price"] = next_stop.get("card_price") or next_stop.get("diesel_price")
-                    state["assigned_stop_net_price"]  = next_stop.get("net_price")
-                    state["all_planned_stops"]        = plan["planned_stops"]
-                    state["planned_stop_index"]       = 0
-                else:
-                    state["all_planned_stops"]        = []
-                    state["planned_stop_index"]       = 0
-                    state["assigned_stop_name"]       = None
-                    state["assigned_stop_lat"]        = None
-                    state["assigned_stop_lng"]        = None
-                    state["assigned_stop_card_price"] = None
-                    state["assigned_stop_net_price"]  = None
+            # Store planned stops so missed-stop detection works
+            if plan.get("planned_stops"):
+                next_stop = plan["planned_stops"][0]
+                state["assigned_stop_name"]       = next_stop["store_name"]
+                state["assigned_stop_lat"]        = next_stop.get("latitude") or next_stop.get("lat")
+                state["assigned_stop_lng"]        = next_stop.get("longitude") or next_stop.get("lng")
+                state["assigned_stop_dist"]       = next_stop.get("dist_from_truck", 0)
+                state["assigned_stop_card_price"] = next_stop.get("card_price") or next_stop.get("diesel_price")
+                state["assigned_stop_net_price"]  = next_stop.get("net_price")
+                state["all_planned_stops"]        = plan["planned_stops"]
+                state["planned_stop_index"]       = 0
+            else:
+                state["all_planned_stops"]        = []
+                state["planned_stop_index"]       = 0
+                state["assigned_stop_name"]       = None
+                state["assigned_stop_lat"]        = None
+                state["assigned_stop_lng"]        = None
+                state["assigned_stop_card_price"] = None
+                state["assigned_stop_net_price"]  = None
 
-                state["briefing_sent_trip"] = route_id
-                try:
-                    from database import save_trip_state
-                    save_trip_state(vname, state)
-                    log.info(f"  {vname}: trip state persisted — trip {route_id}")
-                except Exception as dbe:
-                    log.warning(f"  {vname}: trip state save failed: {dbe}")
+            state["briefing_sent_trip"] = route_id
+            try:
+                from database import save_trip_state
+                save_trip_state(vname, state)
+                log.info(f"  {vname}: trip state persisted — trip {route_id}")
+            except Exception as dbe:
+                log.warning(f"  {vname}: trip state save failed: {dbe}")
 
-                if plan.get("planned_stops"):
-                    log.info(f"  {vname}: route briefing sent — trip {route_id}, "
-                             f"{plan['stops_needed']} stops planned, "
-                             f"first stop: {next_stop['store_name']}")
-                else:
-                    log.info(f"  {vname}: route briefing sent — trip {route_id}, "
-                             f"no stops needed")
+            if plan.get("planned_stops"):
+                log.info(f"  {vname}: route briefing sent — trip {route_id}, "
+                         f"{plan['stops_needed']} stops planned, "
+                         f"first stop: {next_stop['store_name']}")
+            else:
+                log.info(f"  {vname}: route briefing evaluated — trip {route_id}, "
+                         f"no stops needed")
         except Exception as e:
             log.error(f"  {vname}: route briefing failed: {e}", exc_info=True)
 
