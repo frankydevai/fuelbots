@@ -235,23 +235,38 @@ def _build_route(trip: dict, truck_number: str) -> dict | None:
             "appt":         s.get("appointment_date", ""),
         })
 
-    # Origin = first pickup stop with coords
-    origin = next((s for s in stops if s["pickup"] and s["lat"]), None)
+    # ── Strict Origin / Destination Assignment ──────────────────────────────
+    # Origin  = FIRST stop in the array (pickup)
+    # Destination = LAST stop in the array (delivery)
+    # NO fallback — if geocoding fails, skip the trip entirely.
 
-    # Destination = LAST delivery (non-pickup) stop with coords.
-    # This is always the final delivery regardless of trip status.
-    delivery_stops = [s for s in stops if not s["pickup"] and s["lat"]]
-    if delivery_stops:
-        dest = delivery_stops[-1]
-    else:
-        # Fallback: last stop with coords that isn't the origin
-        dest = next(
-            (s for s in reversed(stops) if s["lat"] and s is not origin),
-            None,
+    origin = stops[0]
+    dest   = stops[-1]
+
+    if not origin["lat"]:
+        log.warning(
+            f"Trip {trip.get('trip_num')}: Origin failed to geocode "
+            f"({origin['city']}, {origin['state']})"
         )
+        return None
 
-    if not origin or not dest:
-        log.warning(f"Trip {trip.get('trip_num')}: no coords for origin/dest")
+    if not dest["lat"]:
+        log.warning(
+            f"Trip {trip.get('trip_num')}: Destination failed to geocode "
+            f"({dest['city']}, {dest['state']})"
+        )
+        return None
+
+    # Loop prevention — never process a 0-mile trip on a multi-stop route
+    if (
+        origin["city"].lower() == dest["city"].lower()
+        and origin["state"].lower() == dest["state"].lower()
+        and len(stops_raw) > 1
+    ):
+        log.warning(
+            f"Trip {trip.get('trip_num')}: Origin and Destination are the same "
+            f"({origin['city']}, {origin['state']}) — skipping to prevent 0-mile loop"
+        )
         return None
 
     return {

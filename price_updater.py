@@ -409,6 +409,10 @@ def optimize_route_fuel_plan(
     4. Applies Expensive State / Fuel Desert / Deadhead rules
     5. Recommends 200-gallon Full Tank Fill at best stop
 
+    RADIAL FALLBACK: If the truck is within 50 miles of its destination,
+    directional route filters are bypassed and a simple 30-mile radial
+    True Cost search is performed instead.
+
     Returns complete fuel plan dict.
     """
     from database import get_all_diesel_stops
@@ -418,6 +422,8 @@ def optimize_route_fuel_plan(
     all_stops = get_all_diesel_stops()
     dest = route.get("destination", {})
     dest_state = (dest.get("state") or "").upper()
+    dest_lat = float(dest["lat"]) if dest.get("lat") else None
+    dest_lng = float(dest["lng"]) if dest.get("lng") else None
 
     # Build route states
     route_states = []
@@ -431,7 +437,7 @@ def optimize_route_fuel_plan(
     # 1. Detect expensive states on route
     expensive_ahead = detect_expensive_states_on_route(route_states)
 
-    # 2. Calculate arrival fuel target (30% + 150mi deadhead)
+    # 2. Calculate arrival fuel target (30% reserve)
     arrival_target = calculate_arrival_fuel_target(dest_state, tank_gal, mpg)
 
     # 3. Check for state-line buffering opportunities
@@ -449,11 +455,80 @@ def optimize_route_fuel_plan(
                 "reason": f"Full Tank Fill before {exp['name']} border",
             })
 
-    # 4. Build optimization result
+    # 4. Build warnings
     warnings = []
     if expensive_ahead:
         states_str = ", ".join(e["name"] for e in expensive_ahead)
         warnings.append(f"⚠️ Route crosses expensive state(s): {states_str}")
+
+    # ── RADIAL FALLBACK OVERRIDE ─────────────────────────────────────────
+    # If truck is within 50 miles of destination (or 0-mile round trip),
+    # the strict directional filters in truck_stop_finder will exclude
+    # perfectly valid nearby stations. Bypass them with a simple radial
+    # True Cost search within 30 miles of the truck.
+    radial_stop = None
+    dist_to_dest = None
+    if dest_lat is not None and dest_lng is not None:
+        dist_to_dest = haversine_miles(truck_lat, truck_lng, dest_lat, dest_lng)
+
+    use_radial = (dist_to_dest is not None and dist_to_dest < 50.0) or dist_to_dest is None
+
+    if use_radial:
+        RADIAL_SEARCH_MILES = 30.0
+        gallons_needed = round(tank_gal * (1 - current_fuel_pct / 100), 1)
+        gallons_needed = max(gallons_needed, 15.0)
+        best_tc = float("inf")
+
+        for stop in all_stops:
+            price = stop.get("diesel_price")
+            if not price:
+                continue
+            try:
+                slat = float(stop["latitude"])
+                slng = float(stop["longitude"])
+            except (KeyError, TypeError, ValueError):
+                continue
+
+            dist = haversine_miles(truck_lat, truck_lng, slat, slng)
+            if dist > RADIAL_SEARCH_MILES:
+                continue
+
+            stop_state = (stop.get("state") or "").upper()
+            tc = true_cost_v2(
+                card_price=float(price),
+                stop_state=stop_state,
+                detour_miles=dist,
+                gallons_to_fill=gallons_needed,
+                mpg=mpg,
+            )
+
+            if tc < best_tc:
+                best_tc = tc
+                net = net_price_after_ifta(float(price), stop_state)
+                ifta_rate = get_ifta_rate(stop_state)
+                maps_url = f"https://maps.google.com/?q={slat},{slng}"
+                radial_stop = {
+                    **stop,
+                    "distance_miles": round(dist, 2),
+                    "detour_miles": round(dist, 2),
+                    "true_cost": tc,
+                    "net_price": round(net, 4),
+                    "ifta_rate": round(ifta_rate, 3),
+                    "card_price": round(float(price), 3),
+                    "retail_price": stop.get("retail_price"),
+                    "gallons_to_fill": gallons_needed,
+                    "fill_cost": round(float(price) * gallons_needed, 2),
+                    "google_maps_url": maps_url,
+                }
+
+        if radial_stop:
+            log.info(
+                f"Radial fallback: {radial_stop['store_name']} "
+                f"{radial_stop['distance_miles']:.1f}mi "
+                f"${radial_stop.get('diesel_price','?')}/gal "
+                f"(dist_to_dest={dist_to_dest:.1f}mi)"
+            )
+            warnings.append("📍 Near destination — radial search used for best nearby stop.")
 
     return {
         "arrival_target": arrival_target,
@@ -462,4 +537,7 @@ def optimize_route_fuel_plan(
         "route_states": route_states,
         "fill_amount_gal": FULL_TANK_FILL_GAL,  # Always 200 gal
         "warnings": warnings,
+        "radial_stop": radial_stop,
+        "dist_to_dest": round(dist_to_dest, 1) if dist_to_dest is not None else None,
     }
+
