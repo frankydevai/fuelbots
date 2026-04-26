@@ -16,7 +16,7 @@ import math
 import logging
 from database import get_all_diesel_stops, db_cursor
 from truck_stop_finder import haversine_miles, bearing, angle_diff, reachable_miles
-from ifta import net_price_after_ifta, get_ifta_rate
+from ifta import net_price_after_ifta, get_ifta_rate, HOME_STATE_RATE as _IFTA_HOME_RATE
 from border_strategy import (
     analyze_route_borders, build_border_strategy,
     format_border_warnings, AVOID_FUEL_STATES, LOW_STOP_STATES
@@ -453,10 +453,12 @@ def plan_route_briefing(
         gal_to_fill = round((FILL_TO - max(fuel_arrival, 5)) / 100 * tank_gal, 1)
         gal_to_fill = max(min(gal_to_fill, FULL_TANK_FILL_GAL), 15)  # 200 gal max, 15 gal min
 
-        card_cost = round(s["card_price"] * gal_to_fill, 2)
-        net_cost  = round(s["net_price"]  * gal_to_fill, 2)
-        total_card += card_cost
-        total_net  += net_cost
+        card_cost    = round(s["card_price"] * gal_to_fill, 2)
+        # Net cost = pump cost minus IFTA credit (high-tax stop → you get refund at settlement)
+        _ifta_credit = max(0.0, s.get("ifta_rate", 0.0) - _IFTA_HOME_RATE)
+        net_cost     = round((s["card_price"] - _ifta_credit) * gal_to_fill, 2)
+        total_card  += card_cost
+        total_net   += net_cost
 
         maps_url = (f"https://maps.google.com/?q={s['latitude']},{s['longitude']}"
                     if s.get("latitude") and s.get("longitude") else None)
@@ -563,7 +565,7 @@ def plan_route_briefing(
                 "ifta_rate":        s.get("ifta_rate", 0),
                 "gallons_to_fill":  gal,
                 "total_card_cost":  round(s.get("diesel_price", 0) * gal, 2),
-                "total_net_cost":   round(s.get("net_price", s.get("diesel_price", 0)) * gal, 2),
+                "total_net_cost":   round((s.get("diesel_price", 0) - max(0.0, s.get("ifta_rate", 0.0) - _IFTA_HOME_RATE)) * gal, 2),
                 "maps_url":         (f"https://maps.google.com/?q={s['latitude']},{s['longitude']}"
                                      if s.get("latitude") else None),
                 "low_stop_warning": f"⚠️ Fill to {d['fill_to_pct']:.0f}% — last stop before {d['event'].state_name}",
@@ -603,148 +605,91 @@ def plan_route_briefing(
     }
 
 
+def _fmt_address(stop: dict) -> str:
+    """Build a full address string, appending city/state only if not already in the address field."""
+    raw  = stop.get("address", "").strip()
+    city = stop.get("city", "").strip()
+    st   = stop.get("state", "").strip()
+    if city and city.upper() in raw.upper():
+        return raw  # city already embedded (e.g. "123 Main St, Dallas, TX 75001")
+    return ", ".join(filter(None, [raw, city, st]))
+
+
 def format_route_briefing(plan: dict, truck_name: str,
-                           route: dict, fuel_pct: float, mpg: float) -> str:
+                           route: dict, fuel_pct: float, mpg: float,
+                           driver_name: str = "") -> str:
     """Format the route briefing as a clean Telegram message."""
     if "error" in plan:
         return f"❌ Route plan error: {plan['error']}"
 
-    origin = route.get("origin", {})
-    dest   = route.get("destination", {})
-    trip   = route.get("trip_num", "")
-
-    o_city = f"{origin.get('city','?')}, {origin.get('state','')}"
-    d_city = f"{dest.get('city','?')}, {dest.get('state','')}"
-
-    lines = [
-        f"*Route Fuel Plan - Truck {truck_name}*",
-        f"Trip #{trip}  |  {o_city} -> {d_city}",
-        f"{plan['total_distance']:.0f} miles  |  {fuel_pct:.0f}% fuel  |  {mpg:.1f} MPG",
-        f"⛽ *Fill Instruction: Full Tank Fill (200 Gallons)*",
-        "",
-    ]
-
-    truck_lat = plan.get("truck_lat")
-    truck_lng = plan.get("truck_lng")
-    if truck_lat is not None and truck_lng is not None:
-        lines.append(f"Current location: [{truck_lat:.4f}, {truck_lng:.4f}](https://maps.google.com/?q={truck_lat},{truck_lng})")
-        lines.append("")
-
-    if plan.get("emergency_mode"):
-        lines.append("EMERGENCY: fuel is critically low. Route pricing is secondary to reaching fuel safely.")
-        lines.append("")
-    elif plan.get("critical_mode"):
-        lines.append("CRITICAL: fuel is low. The first safe stop is prioritized before later cheaper options.")
-        lines.append("")
-
     if plan["can_complete_without_stop"]:
-        # User requested to suppress alerts if no fuel stops are needed
         return ""
 
     if not plan["planned_stops"]:
-        lines.append("No fuel stop recommendation is available for this route yet.")
-        return "\n".join(lines)
-
+        return ""
 
     total = plan["stops_needed"]
-    lines.append(f"⛽ *First fuel stop* (trip needs ~{total} stop{'s' if total > 1 else ''} total):")
-    lines.append("")
+    s = plan["planned_stops"][0]
 
-    # Only show the FIRST stop — next stop sent when truck needs fuel
-    for s in plan["planned_stops"][:1]:
-        if s.get("low_stop_warning"):
-            lines.append(s["low_stop_warning"])
+    fill_instruction = s.get("low_stop_warning") or "Full Tank Fill (200 Gallons)"
+    header_name = f"{truck_name} - {driver_name}" if driver_name else truck_name
+    address = _fmt_address(s)
 
-        lines.append(f"*Stop {s['stop_number']} — {s['store_name']}*")
-        lines.append(f"📌 {s['address']}, {s['city']}, {s['state']}")
-        lines.append(f"🛣 {s['dist_from_truck']:.0f} mi from current position")
+    maps_url = s.get("maps_url") or (
+        f"https://maps.google.com/?q={s.get('latitude')},{s.get('longitude')}"
+        if s.get("latitude") and s.get("longitude") else None
+    )
 
-        if s.get("retail_price"):
-            lines.append(f"💰 Retail: ${s['retail_price']:.3f}/gal")
-        if s.get("card_price"):
-            lines.append(f"💳 Card:   *${s['card_price']:.3f}/gal*")
-        
-        lines.append("")
-        
-        if plan.get("ifta_enabled"):
-            if abs(s["total_net_cost"] - s["total_card_cost"]) >= 1:
-                lines.append(
-                    f"💵 Fill *{s['gallons_to_fill']:.0f} gal* → "
-                    f"Pump: ${s['total_card_cost']:.0f} · "
-                    f"Net after IFTA: *${s['total_net_cost']:.0f}*"
-                )
-            else:
-                lines.append(
-                    f"💵 Fill *{s['gallons_to_fill']:.0f} gal* → "
-                    f"Estimated total: *${s['total_card_cost']:.0f}*"
-                )
-        else:
-            lines.append(
-                f"💵 Fill *{s['gallons_to_fill']:.0f} gal* → "
-                f"Card total: *${s['total_card_cost']:.0f}*"
-            )
-            lines.append("📋 IFTA adjustment is off because `IFTA_HOME_STATE` is not set.")
+    lines = [
+        f"⛽ FUEL PLAN - TRUCK {header_name} ⛽",
+        f"⛽ Current Fuel: {fuel_pct:.0f}%",
+        f"🎯 NEXT STOP (In {s['dist_from_truck']:.0f} miles):",
+        "",
+        s["store_name"],
+        f"📌 {address}",
+    ]
 
-        lines.append("")
-        if s.get("maps_url"):
-            lines.append(f"🗺️ [Open in Google Maps]({s['maps_url']})")
+    if maps_url:
+        lines.append(f"🗺️ [Directions]({maps_url})")
 
-    # Note about remaining stops
+    lines += [
+        "💧 INSTRUCTIONS:",
+        fill_instruction,
+    ]
+
     if total > 1:
-        lines += [
-            "",
-            f"📍 Next stop will be sent when fuel is needed.",
-        ]
+        lines += ["", "📍 Next stop will be sent when fuel is needed."]
 
     return "\n".join(lines)
 
 
 def format_next_stop(stop: dict, stop_num: int, total_stops: int,
                      truck_name: str, current_fuel_pct: float,
-                     tank_gal: float = 150) -> str:
-    """
-    Format the next fuel stop alert — sent after truck refuels and needs the next stop.
-    Simple and clean — one stop, all info driver needs.
-    """
-    NL = "\n"
-    name   = stop.get("store_name", "Unknown")
-    addr   = ", ".join(filter(None, [
-        stop.get("address",""), stop.get("city",""), stop.get("state","")
-    ]))
-    dist   = stop.get("dist_from_truck", 0)
-    card   = stop.get("card_price", 0)
-    retail = stop.get("retail_price", 0)
-    net    = stop.get("net_price", card)
-    lat    = stop.get("latitude","")
-    lng    = stop.get("longitude","")
-
-    gallons   = round(tank_gal * (1 - current_fuel_pct / 100) * 0.9, 0)
-    pump_cost = round(card * gallons, 0) if card else 0
-    net_cost  = round(net  * gallons, 0) if net  else pump_cost
+                     tank_gal: float = 150, driver_name: str = "") -> str:
+    """Format the next fuel stop alert — sent after truck refuels and needs the next stop."""
+    name = stop.get("store_name", "Unknown")
+    addr = _fmt_address(stop)
+    dist = stop.get("dist_from_truck", 0)
+    lat  = stop.get("latitude") or stop.get("lat") or ""
+    lng  = stop.get("longitude") or stop.get("lng") or ""
+    maps_url = f"https://maps.google.com/?q={lat},{lng}" if lat and lng else ""
+    fill_instruction = stop.get("low_stop_warning") or "Full Tank Fill (200 Gallons)"
+    header_name = f"{truck_name} - {driver_name}" if driver_name else truck_name
 
     lines = [
-        f"⛽ *Next Fuel Stop — Truck {truck_name}*",
-        f"Stop {stop_num} of {total_stops}",
+        f"⛽ FUEL PLAN - TRUCK {header_name} ⛽",
+        f"⛽ Current Fuel: {current_fuel_pct:.0f}%",
+        f"🎯 NEXT STOP (In {dist:.0f} miles):",
         "",
-        f"*{name}*",
+        name,
     ]
     if addr:
         lines.append(f"📌 {addr}")
-    if dist:
-        lines.append(f"🛣 {dist:.0f} mi from current position")
-    if retail and retail != card:
-        lines.append(f"💰 Retail: ${retail:.3f}/gal")
-    if card:
-        lines.append(f"💳 Card:   *${card:.3f}/gal*")
-    if pump_cost:
-        if IFTA_HOME_STATE and abs(net_cost - pump_cost) > 1:
-            lines.append(f"💵 Fill ~{gallons:.0f} gal → Pump: ${pump_cost:.0f} · Net after IFTA: *${net_cost:.0f}*")
-        elif IFTA_HOME_STATE:
-            lines.append(f"💵 Fill ~{gallons:.0f} gal → Estimated total: ${pump_cost:.0f}")
-        else:
-            lines.append(f"💵 Fill ~{gallons:.0f} gal → Card total: ${pump_cost:.0f}")
-            lines.append("📋 IFTA adjustment is off because `IFTA_HOME_STATE` is not set.")
-    if lat and lng:
-        lines.append(f"🗺 [Open in Google Maps](https://maps.google.com/?q={lat},{lng})")
+    if maps_url:
+        lines.append(f"🗺️ [Directions]({maps_url})")
+    lines += [
+        "💧 INSTRUCTIONS:",
+        fill_instruction,
+    ]
 
-    return NL.join(lines)
+    return "\n".join(lines)

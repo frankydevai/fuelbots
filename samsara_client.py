@@ -70,8 +70,9 @@ def get_combined_vehicle_data() -> list[dict]:
     """
     Merge locations + fuel stats into one list per vehicle.
     Returns list of dicts with: vehicle_id, vehicle_name, lat, lng,
-    heading, speed_mph, fuel_pct.
+    heading, speed_mph, fuel_pct, gps_stale, gps_age_minutes.
     """
+    from datetime import datetime, timezone
     locations_raw = get_vehicle_locations()
     stats_raw     = get_vehicle_stats()
 
@@ -94,6 +95,7 @@ def get_combined_vehicle_data() -> list[dict]:
         else:
             stats_map[vid] = 100.0
 
+    now = datetime.now(timezone.utc)
     results = []
     for v in locations_raw:
         vid  = v.get("id")
@@ -105,18 +107,30 @@ def get_combined_vehicle_data() -> list[dict]:
         if lat is None or lng is None:
             continue
 
+        # Compute GPS age for stale-location warning
+        gps_age_minutes = 0
+        ts = loc.get("time", "")
+        if ts:
+            try:
+                t = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                gps_age_minutes = (now - t).total_seconds() / 60
+            except Exception:
+                pass
+
         driver      = get_driver_for_vehicle(vid)
         driver_name = driver.get("name") if driver else None
 
         results.append({
-            "vehicle_id":   vid,
-            "vehicle_name": name,
-            "driver_name":  driver_name,
-            "lat":          float(lat),
-            "lng":          float(lng),
-            "heading":      float(loc.get("heading", 0)),
-            "speed_mph":    float(loc.get("speed", 0)),
-            "fuel_pct":     stats_map.get(vid, 100.0),
+            "vehicle_id":       vid,
+            "vehicle_name":     name,
+            "driver_name":      driver_name,
+            "lat":              float(lat),
+            "lng":              float(lng),
+            "heading":          float(loc.get("heading", 0)),
+            "speed_mph":        float(loc.get("speed", 0)),
+            "fuel_pct":         stats_map.get(vid, 100.0),
+            "gps_age_minutes":  round(gps_age_minutes, 1),
+            "gps_stale":        gps_age_minutes > 30,
         })
 
     return results

@@ -271,6 +271,136 @@ def find_cheaper_nearby(truck_lat: float, truck_lng: float,
     return best
 
 
+def find_emergency_stop(
+    truck_lat: float,
+    truck_lng: float,
+    truck_heading: float,
+    fuel_pct: float,
+    tank_gal: float,
+    mpg: float,
+    range_budget_miles: float,
+    truck_state: str = "",
+) -> dict | None:
+    """
+    Find the cheapest reachable stop when the planned stop is unreachable.
+
+    range_budget_miles is the caller's raw range (fuel/100 * tank * mpg * 0.85),
+    which already includes a 15% safety margin. SAFETY_RESERVE is NOT applied
+    again here — doing so would incorrectly shrink the search to near zero at
+    low fuel levels with large tanks.
+
+    Search radius = min(range_budget * 0.85, 150 miles).
+    Scores by IFTA-adjusted net price (cheapest wins), with a tiny distance
+    tie-breaker so two equal-price stops resolve to the closer one.
+    """
+    max_search = min(range_budget_miles * 0.85, 150.0)
+    all_stops  = get_all_diesel_stops()
+    candidates = []
+
+    for stop in all_stops:
+        if not stop.get("diesel_price"):
+            continue
+        slat = float(stop["latitude"])
+        slng = float(stop["longitude"])
+        dist = haversine_miles(truck_lat, truck_lng, slat, slng)
+
+        if dist > max_search:
+            continue
+
+        stop_state = (stop.get("state") or "").upper()
+
+        # Never send driver into CA to fuel when coming from outside — too expensive
+        if stop_state == "CA" and (truck_state or "").upper() != "CA":
+            continue
+
+        try:
+            from ifta import net_price_after_ifta, get_ifta_rate
+            net_price = net_price_after_ifta(float(stop["diesel_price"]), stop_state)
+            ifta_rate = get_ifta_rate(stop_state)
+        except Exception:
+            net_price = float(stop["diesel_price"])
+            ifta_rate = 0.0
+
+        fill_gal = gallons_to_fill(fuel_pct, tank_gal)
+        score    = net_price * fill_gal + dist * 0.01  # price-primary, distance tie-breaker
+
+        ahead = True
+        if truck_heading is not None:
+            bear  = bearing(truck_lat, truck_lng, slat, slng)
+            ahead = angle_diff(truck_heading, bear) <= _AHEAD_ARC_DEGREES
+        if not ahead:
+            score += BEHIND_PENALTY_MILES * float(stop["diesel_price"])
+
+        candidates.append({
+            **stop,
+            "distance_miles":  round(dist, 2),
+            "net_price":       round(net_price, 4),
+            "ifta_rate":       round(ifta_rate, 3),
+            "_score":          score,
+            "_ahead":          ahead,
+            "google_maps_url": f"https://maps.google.com/?q={slat},{slng}",
+        })
+
+    if not candidates:
+        log.warning(
+            f"find_emergency_stop: no stops within {max_search:.0f}mi "
+            f"(range_budget={range_budget_miles:.0f}mi)"
+        )
+        return None
+
+    candidates.sort(key=lambda s: s["_score"])
+    best = candidates[0]
+    log.info(
+        f"Emergency fallback: {best['store_name']} {best['distance_miles']:.0f}mi "
+        f"${best.get('diesel_price','?')}/gal net=${best['net_price']:.3f} "
+        f"(range_budget={range_budget_miles:.0f}mi max_search={max_search:.0f}mi)"
+    )
+    return best
+
+
+def find_critical_radial_stop(
+    truck_lat: float,
+    truck_lng: float,
+    radius_miles: float = 50.0,
+) -> dict | None:
+    """
+    Critical fuel override (≤20% fuel): find the closest diesel stop within
+    radius_miles using pure haversine distance — no directional filter,
+    no CA exclusion, no price scoring. Nearest stop wins.
+    """
+    all_stops  = get_all_diesel_stops()
+    candidates = []
+
+    for stop in all_stops:
+        if not stop.get("diesel_price"):
+            continue
+        slat = float(stop["latitude"])
+        slng = float(stop["longitude"])
+        dist = haversine_miles(truck_lat, truck_lng, slat, slng)
+        if dist > radius_miles:
+            continue
+        candidates.append({
+            **stop,
+            "distance_miles":  round(dist, 2),
+            "google_maps_url": f"https://maps.google.com/?q={slat},{slng}",
+        })
+
+    if not candidates:
+        log.warning(
+            f"find_critical_radial_stop: no stops within {radius_miles:.0f}mi — "
+            f"expanding to emergency fallback"
+        )
+        return None
+
+    candidates.sort(key=lambda s: s["distance_miles"])
+    best = candidates[0]
+    log.info(
+        f"CRITICAL radial stop: {best['store_name']} {best['distance_miles']:.0f}mi "
+        f"${best.get('diesel_price','?')}/gal (no filters, radius={radius_miles:.0f}mi)"
+    )
+    return best
+
+
 def find_best_stops(
     truck_lat: float,
     truck_lng: float,

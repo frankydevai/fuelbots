@@ -74,18 +74,6 @@ def _truck_route_keys(vehicle_name: str) -> list[str]:
     return keys
 
 
-# -- Price updater scheduler --------------------------------------------------
-_last_price_update = None   # Track last update time
-
-def _should_update_prices(now: datetime) -> bool:
-    """Run price update once daily at 06:00 UTC."""
-    global _last_price_update
-    if _last_price_update is None:
-        return True  # Always run on startup
-    hours_since = (now - _last_price_update).total_seconds() / 3600
-    return hours_since >= 23 and now.hour == 6
-
-
 
 # -- Main loop ----------------------------------------------------------------
 def main():
@@ -302,8 +290,7 @@ def main():
                             due_trucks.append(truck)
 
             if telegram_bot.force_check_now:
-                import main as _main
-                _main.force_check_now = False
+                telegram_bot.force_check_now = False
                 log.info(f"/checknow: forcing check on all {len(due_trucks)} trucks")
 
             log.info(f"Poll #{poll_cycle}: {len(all_trucks)} trucks  "

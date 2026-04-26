@@ -10,6 +10,7 @@ Tables:
   bot_config      - key/value store for config (pilot locations cache etc.)
 """
 
+import json
 import logging
 import time
 import psycopg2
@@ -854,7 +855,6 @@ def set_bot_config(key: str, value: str):
 
 def save_truck_route(truck_number: str, group_chat_id: str, route: dict) -> None:
     """Save parsed QM Notifier route for a truck."""
-    import json
     with db_cursor() as cur:
         cur.execute("""
             INSERT INTO truck_routes (truck_number, group_chat_id, trip_num, ref_number, route_json, updated_at)
@@ -877,7 +877,6 @@ def save_truck_route(truck_number: str, group_chat_id: str, route: dict) -> None
 
 def get_truck_route(truck_number: str) -> dict | None:
     """Get the last saved route for a truck."""
-    import json
     with db_cursor() as cur:
         cur.execute(
             "SELECT route_json FROM truck_routes WHERE truck_number = %s",
@@ -891,7 +890,6 @@ def get_truck_route(truck_number: str) -> dict | None:
 
 def get_all_truck_routes_from_db() -> dict[str, dict]:
     """Get all saved routes keyed by truck_number."""
-    import json
     routes = {}
     with db_cursor() as cur:
         cur.execute("SELECT truck_number, route_json FROM truck_routes")
@@ -904,9 +902,6 @@ def get_all_truck_routes_from_db() -> dict[str, dict]:
     return routes
 
 
-def get_last_qm_message(chat_id: str) -> dict | None:
-    """Stub — routes stored via save_truck_route."""
-    return None
 
 def log_stop_visit(vehicle_name: str, alert_id: int,
                    recommended_stop_name: str,
@@ -946,6 +941,59 @@ def log_stop_visit(vehicle_name: str, alert_id: int,
             visited, fuel_before, fuel_after, gallons_purchased, savings_usd,
             datetime.now(timezone.utc)
         ))
+
+
+def log_driver_flag(
+    truck_id: str,
+    driver_name: str,
+    flag_type: str,
+    planned_stop: str,
+    actual_stop: str,
+    fuel_pct: float,
+    details: str = None,
+    savings_lost: float = None,
+) -> int:
+    """
+    Log a driver compliance flag to driver_flags.
+
+    Creates the table and adds driver_name/planned_stop columns if they don't
+    exist yet (safe to call alongside flag_system.save_flag).
+
+    Returns the new row id.
+    """
+    with db_cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS driver_flags (
+                id           SERIAL PRIMARY KEY,
+                flagged_at   TIMESTAMPTZ DEFAULT NOW(),
+                vehicle_name TEXT NOT NULL,
+                flag_type    TEXT NOT NULL,
+                details      TEXT,
+                recommended_stop TEXT,
+                actual_stop  TEXT,
+                fuel_pct     REAL,
+                state        TEXT,
+                savings_lost REAL
+            )
+        """)
+        for col_sql in [
+            "ALTER TABLE driver_flags ADD COLUMN IF NOT EXISTS driver_name TEXT",
+            "ALTER TABLE driver_flags ADD COLUMN IF NOT EXISTS planned_stop TEXT",
+        ]:
+            cur.execute(col_sql)
+
+        cur.execute(
+            """
+            INSERT INTO driver_flags
+                (vehicle_name, driver_name, flag_type, planned_stop,
+                 actual_stop, fuel_pct, details, savings_lost)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING id
+            """,
+            (truck_id, driver_name or "", flag_type,
+             planned_stop, actual_stop, fuel_pct, details, savings_lost),
+        )
+        return cur.fetchone()["id"]
 
 
 def get_stop_compliance(vehicle_name: str = None, days: int = 7) -> list:
@@ -989,19 +1037,6 @@ def save_truck_efficiency(vehicle_id: str, vehicle_name: str,
                 fuel_used_30d  = EXCLUDED.fuel_used_30d,
                 updated_at     = NOW()
         """, (vehicle_id, vehicle_name, mpg, idle_hours, idle_pct, fuel_gal))
-
-
-def get_truck_mpg(vehicle_id: str) -> float:
-    """Get real MPG for a truck. Returns 6.5 default if not available."""
-    with db_cursor() as cur:
-        cur.execute(
-            "SELECT mpg FROM truck_efficiency WHERE vehicle_id = %s",
-            (vehicle_id,)
-        )
-        row = cur.fetchone()
-        if row and row["mpg"] and row["mpg"] > 0:
-            return float(row["mpg"])
-    return 6.5  # default
 
 
 def get_all_truck_efficiency() -> list:
@@ -1094,8 +1129,6 @@ def get_compliance_for_report(days: int = 7) -> list:
 
 def save_trip_state(vehicle_name: str, state: dict) -> None:
     """Save trip planning state to DB — survives bot restarts."""
-    import json
-
     # Collect all border_warned_{STATE} keys into a single dict
     border_warned = {
         k.replace("border_warned_", ""): v
@@ -1151,61 +1184,47 @@ def save_trip_state(vehicle_name: str, state: dict) -> None:
         ))
 
 
-def load_trip_state(vehicle_name: str) -> dict:
-    """Load persisted trip state for a truck. Returns {} if not found."""
-    import json
-    with db_cursor() as cur:
-        cur.execute(
-            "SELECT * FROM trip_state WHERE vehicle_name = %s",
-            (vehicle_name,)
-        )
-        row = cur.fetchone()
-    if not row:
-        return {}
-    result = {}
-    try: result["briefing_sent_trip"]       = row["briefing_sent_trip"]
-    except: pass
-    try: result["all_planned_stops"]        = json.loads(row["all_planned_stops"] or "[]")
-    except: result["all_planned_stops"]     = []
-    try: result["planned_stop_index"]       = row["planned_stop_index"] or 0
-    except: result["planned_stop_index"]    = 0
-    try: result["assigned_stop_name"]       = row["assigned_stop_name"]
-    except: pass
-    try: result["assigned_stop_lat"]        = row["assigned_stop_lat"]
-    except: pass
-    try: result["assigned_stop_lng"]        = row["assigned_stop_lng"]
-    except: pass
-    try: result["assigned_stop_card_price"] = row["assigned_stop_card_price"]
-    except: pass
-    try: result["assigned_stop_net_price"]  = row["assigned_stop_net_price"]
-    except: pass
-    try: result["missed_stop_name"]         = row["missed_stop_name"]
-    except: pass
-    try: result["missed_stop_card_price"]   = row["missed_stop_card_price"]
-    except: pass
+def _parse_trip_state_row(row: dict) -> dict:
+    result = {
+        "briefing_sent_trip":       row.get("briefing_sent_trip"),
+        "planned_stop_index":       row.get("planned_stop_index") or 0,
+        "assigned_stop_name":       row.get("assigned_stop_name"),
+        "assigned_stop_lat":        row.get("assigned_stop_lat"),
+        "assigned_stop_lng":        row.get("assigned_stop_lng"),
+        "assigned_stop_card_price": row.get("assigned_stop_card_price"),
+        "assigned_stop_net_price":  row.get("assigned_stop_net_price"),
+        "missed_stop_name":         row.get("missed_stop_name"),
+        "missed_stop_card_price":   row.get("missed_stop_card_price"),
+    }
     try:
-        wps = json.loads(row["completed_waypoints"] or "[]")
-        result["completed_waypoints"] = set(wps)
-    except:
+        result["all_planned_stops"] = json.loads(row.get("all_planned_stops") or "[]")
+    except (json.JSONDecodeError, TypeError):
+        result["all_planned_stops"] = []
+    try:
+        result["completed_waypoints"] = set(json.loads(row.get("completed_waypoints") or "[]"))
+    except (json.JSONDecodeError, TypeError):
         result["completed_waypoints"] = set()
-    # Restore border_warned_{STATE} keys into state
     try:
         bw = json.loads(row.get("border_warned") or "{}")
         for state_code, warned in bw.items():
             if warned:
                 result[f"border_warned_{state_code}"] = True
-    except:
+    except (json.JSONDecodeError, TypeError):
         pass
     return result
+
+
+def load_trip_state(vehicle_name: str) -> dict:
+    """Load persisted trip state for a truck. Returns {} if not found."""
+    with db_cursor() as cur:
+        cur.execute("SELECT * FROM trip_state WHERE vehicle_name = %s", (vehicle_name,))
+        row = cur.fetchone()
+    return _parse_trip_state_row(dict(row)) if row else {}
 
 
 def load_all_trip_states() -> dict:
     """Load all persisted trip states on bot startup. Returns {vehicle_name: state_dict}."""
     with db_cursor() as cur:
-        cur.execute("SELECT vehicle_name FROM trip_state")
+        cur.execute("SELECT * FROM trip_state")
         rows = cur.fetchall()
-    result = {}
-    for row in rows:
-        vname = row["vehicle_name"]
-        result[vname] = load_trip_state(vname)
-    return result
+    return {row["vehicle_name"]: _parse_trip_state_row(dict(row)) for row in rows}

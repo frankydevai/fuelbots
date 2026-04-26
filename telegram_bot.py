@@ -170,7 +170,8 @@ def send_low_fuel_alert(vehicle_name, fuel_pct, truck_lat, truck_lng,
 
 def send_emergency_alert(vehicle_name, fuel_pct, truck_lat, truck_lng,
                           heading, speed_mph, best_stop,
-                          planned_stop_name=None, range_miles=0) -> dict:
+                          planned_stop_name=None, range_miles=0,
+                          gps_stale=False) -> dict:
     """
     Emergency alert — only fires when truck cannot reach planned stop.
     Sent to driver group + dispatcher immediately.
@@ -183,8 +184,10 @@ def send_emergency_alert(vehicle_name, fuel_pct, truck_lat, truck_lng,
         f"⛽ Fuel: *{fuel_pct:.0f}%*  🧭 {speed_mph:.0f} mph {compass}",
         f"📍 [Truck Location]({truck_url})",
         f"🌐 `{truck_lat:.5f}, {truck_lng:.5f}`",
-        "",
     ]
+    if gps_stale:
+        lines.append("⚠️ _GPS location may be outdated — verify with driver_")
+    lines.append("")
 
     if planned_stop_name:
         lines.append(f"⚠️ Cannot reach planned stop: *{planned_stop_name}*")
@@ -899,6 +902,7 @@ def _handle_route(text: str, chat_id: str) -> None:
         stop_n  = s.get("stop_num", i)
         is_next = (city == dest.get("city") and state == dest.get("state"))
         arrow   = "  ← *NEXT*" if is_next else ""
+        appt    = s.get("appointment") or s.get("appointment_time") or s.get("appt")
         lines  += [f"{icon} *Stop {stop_n} — {stype}*{arrow}", f"   {company}", f"   📍 {loc}"]
         if appt:
             lines.append(f"   🕐 {str(appt)[:16].replace('T',' ')}")

@@ -32,10 +32,9 @@ LOSS_CALC_GALLONS = 100
 
 
 def _ensure_flags_table():
-    """Create flags table if not exists."""
+    """Create flags table if not exists, add any missing columns."""
     with db_cursor() as cur:
-        cur.execute(
-            """
+        cur.execute("""
             CREATE TABLE IF NOT EXISTS driver_flags (
                 id               SERIAL PRIMARY KEY,
                 vehicle_name     TEXT NOT NULL,
@@ -47,10 +46,14 @@ def _ensure_flags_table():
                 state            TEXT,
                 savings_lost     REAL,
                 flagged_at       TIMESTAMPTZ DEFAULT NOW()
-            );
-            ALTER TABLE driver_flags ADD COLUMN IF NOT EXISTS savings_lost REAL;
-            """
-        )
+            )
+        """)
+        for col_sql in [
+            "ALTER TABLE driver_flags ADD COLUMN IF NOT EXISTS savings_lost REAL",
+            "ALTER TABLE driver_flags ADD COLUMN IF NOT EXISTS driver_name TEXT",
+            "ALTER TABLE driver_flags ADD COLUMN IF NOT EXISTS planned_stop TEXT",
+        ]:
+            cur.execute(col_sql)
 
 
 def save_flag(
@@ -61,6 +64,7 @@ def save_flag(
     actual_stop: str = None,
     fuel_pct: float = None,
     state: str = None,
+    driver_name: str = None,
 ) -> int:
     """Save a flag to DB. Returns flag ID."""
     _ensure_flags_table()
@@ -68,12 +72,13 @@ def save_flag(
         cur.execute(
             """
             INSERT INTO driver_flags
-                (vehicle_name, flag_type, details, recommended_stop,
+                (vehicle_name, driver_name, flag_type, details, recommended_stop,
                  actual_stop, fuel_pct, state)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING id
             """,
-            (vehicle_name, flag_type, details, recommended_stop, actual_stop, fuel_pct, state),
+            (vehicle_name, driver_name or "", flag_type, details,
+             recommended_stop, actual_stop, fuel_pct, state),
         )
         return cur.fetchone()["id"]
 
@@ -97,36 +102,43 @@ def flag_wrong_stop(
     fuel_after: float,
     rec_card_price: float = None,
     actual_card_price: float = None,
+    driver_name: str = None,
+    gallons_to_fill: float = None,
 ) -> None:
     """Driver fueled at a different stop than recommended.
 
-    Financial loss = (actual_price - rec_price) × 100 gallons
+    Financial loss = (actual_price - rec_price) × actual gallons filled
+    (falls back to LOSS_CALC_GALLONS if actual gallons not provided)
     This is charged to the driver's profile for the weekly report.
     """
+    loss_gallons = gallons_to_fill if gallons_to_fill is not None else LOSS_CALC_GALLONS
+
     # Calculate lost savings
     savings_lost = 0.0
     loss_line = ""
     if rec_card_price and actual_card_price and actual_card_price > rec_card_price:
         price_diff = actual_card_price - rec_card_price
-        savings_lost = round(price_diff * LOSS_CALC_GALLONS, 2)
+        savings_lost = round(price_diff * loss_gallons, 2)
         loss_line = (
-            f"\n💸 *Lost Savings: ${savings_lost:.2f}*"
-            f"\n📊 (${actual_card_price:.3f} - ${rec_card_price:.3f}) × {LOSS_CALC_GALLONS} gal"
+            f"\n💸 *Estimated Loss: ${savings_lost:.2f}*"
+            f"\n📊 (${actual_card_price:.3f} - ${rec_card_price:.3f}) × {loss_gallons:.0f} gal"
         )
     elif rec_card_price and actual_card_price:
         loss_line = f"\n✅ No financial loss — actual price was equal or cheaper."
 
-    msg = (
-        f"🚩 *Flag Alert — Truck {vehicle_name}*\n"
-        f"🧾 Type: *Wrong Fuel Stop*\n\n"
-        f"✅ Recommended stop: *{recommended}*"
-        + (f" (${rec_card_price:.3f}/gal)" if rec_card_price else "") +
-        f"\n❌ Actual stop: *{actual}*"
-        + (f" (${actual_card_price:.3f}/gal)" if actual_card_price else "") +
-        f"\n⛽ Fuel: {fuel_before:.0f}% → {fuel_after:.0f}%"
-        f"{loss_line}\n\n"
-        f"⚠️ Driver did not follow the fuel recommendation."
-    )
+    driver_line   = f"\n👤 Driver: *{driver_name}*" if driver_name else ""
+    rec_price_str = f" (${rec_card_price:.3f}/gal)" if rec_card_price else ""
+    act_price_str = f" (${actual_card_price:.3f}/gal)" if actual_card_price else ""
+    msg = "\n".join(filter(None, [
+        f"🚩 *WRONG STOP — Truck {vehicle_name}*{driver_line}",
+        "",
+        f"✅ Planned stop: *{recommended}*{rec_price_str}",
+        f"❌ Entered: *{actual}*{act_price_str}",
+        f"⛽ Fuel: {fuel_before:.0f}%",
+        loss_line.strip() if loss_line else None,
+        "",
+        "⚠️ Incident logged.",
+    ]))
     flag_id = save_flag(
         vehicle_name,
         FLAG_WRONG_STOP,
@@ -134,6 +146,7 @@ def flag_wrong_stop(
         recommended_stop=recommended,
         actual_stop=actual,
         fuel_pct=fuel_before,
+        driver_name=driver_name,
     )
 
     # Save financial loss to flag record
