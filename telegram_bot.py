@@ -88,81 +88,33 @@ def _urgency_emoji(fuel_pct: float) -> str:
 
 def send_low_fuel_alert(vehicle_name, fuel_pct, truck_lat, truck_lng,
                         heading, speed_mph, best_stop, alt_stop=None, savings_usd=None) -> dict:
-    """
-    Send fuel alert with single cheapest stop on route.
-    No comparisons. Shows: stop name, distance, pump price,
-    IFTA net cost, gallons needed, total fill cost.
-    """
-    emoji     = _urgency_emoji(fuel_pct)
-    truck_url = f"https://maps.google.com/?q={truck_lat:.6f},{truck_lng:.6f}"
-    compass   = _compass(heading)
-
+    """Send fuel plan — next stop name, address, Google Maps link, gallons to fill."""
+    emoji = _urgency_emoji(fuel_pct)
     lines = [
-        f"{emoji} *Low Fuel Alert — Truck {vehicle_name}*",
-        f"⛽ Fuel: *{fuel_pct:.0f}%*   🧭 {speed_mph:.0f} mph {compass}",
-        f"📍 [Truck Location]({truck_url})",
-        f"🌐 `{truck_lat:.5f}, {truck_lng:.5f}`",
+        f"{emoji} *Fuel Stop — Truck {vehicle_name}*",
+        f"⛽ Fuel: *{fuel_pct:.0f}%*",
     ]
 
     if best_stop:
+        from config import DEFAULT_TANK_GAL
         name     = best_stop.get("store_name", "Unknown")
         street   = best_stop.get("address", "")
         city     = best_stop.get("city", "")
         state    = best_stop.get("state", "")
         zip_code = best_stop.get("zip", "")
-        dist     = best_stop.get("distance_miles", 0)
-        pump     = best_stop.get("diesel_price")
-        net      = best_stop.get("net_price")
-        ifta_r   = best_stop.get("ifta_rate", 0)
         lat      = best_stop.get("latitude")
         lng      = best_stop.get("longitude")
-        discount = best_stop.get("discount_per_gallon")
-
         addr     = ", ".join(filter(None, [street, city, state, zip_code]))
         maps_url = f"https://maps.google.com/?q={lat},{lng}" if lat and lng else None
+        gallons  = round(DEFAULT_TANK_GAL * (1 - fuel_pct / 100), 1)
 
-        # Gallons needed to fill tank
-        from config import DEFAULT_TANK_GAL
-        gallons_needed = round(DEFAULT_TANK_GAL * (1 - fuel_pct / 100), 1)
-
-        lines += ["", f"⛽ *{name}*", f"📌 {addr}", f"🛣 *{dist:.1f} mi ahead*"]
-
-        retail   = best_stop.get("retail_price")
-
-        # Line 1 — Retail price (what pump shows publicly)
-        if retail and retail != pump:
-            lines.append(f"💰 Retail:  ${retail:.3f}/gal")
-
-        # Line 2 — Card price (what driver actually pays with EFS card)
-        if pump:
-            if discount and discount > 0:
-                lines.append(f"💳 Card:    *${pump:.3f}/gal*  (save ${discount:.2f}/gal)")
-            else:
-                lines.append(f"💳 Card:    *${pump:.3f}/gal*")
-
-        # IFTA used only for fill cost calculation — not shown as separate line
-        if not (net and pump and abs(net - pump) > 0.005):
-            net = pump  # no IFTA difference — use pump price
-
-        # Line 3 — Total fill cost
-        true_price = net if net else pump
-        if pump and true_price:
-            pay_pump = round(pump * gallons_needed, 2)
-            pay_net  = round(true_price * gallons_needed, 2)
-            if abs(pay_net - pay_pump) > 1:
-                lines.append(f"💵 Fill *{gallons_needed:.0f} gal* → Pump: ${pay_pump:.0f} · Net after IFTA: *${pay_net:.0f}*")
-            else:
-                lines.append(f"💵 Fill *{gallons_needed:.0f} gal = ${pay_pump:.0f}*")
-
+        lines += ["", f"⛽ *Next Stop: {name}*", f"📌 {addr}"]
         if maps_url:
             lines.append(f"🗺 [Open in Google Maps]({maps_url})")
-
+        lines.append(f"💧 Fill *{gallons:.0f} gallons*")
     else:
         lines += ["", "❌ No fuel stops found on route.", "Dispatcher has been notified."]
-        _send_to_dispatcher(f"{emoji} *{vehicle_name}* — {fuel_pct:.0f}% — NO STOP FOUND on route")
-
-    if fuel_pct <= 15 and best_stop:
-        _send_to_dispatcher(f"{emoji} *{vehicle_name}* critically low — {fuel_pct:.0f}%")
+        _send_to_dispatcher(f"{emoji} *{vehicle_name}* — {fuel_pct:.0f}% — NO STOP FOUND")
 
     result = _send_to_truck(vehicle_name, "\n".join(lines))
     return result if isinstance(result, dict) else {"truck_group": None, "truck_msg_id": result, "dispatcher_msg_id": None}
@@ -1495,16 +1447,16 @@ def send_weekly_savings_report() -> None:
     with db_cursor() as cur:
         cur.execute("""
             SELECT COUNT(*) AS total_alerts,
-                   COUNT(DISTINCT vehicle_id) AS trucks_active,
+                   COUNT(DISTINCT vehicle_name) AS trucks_active,
                    COALESCE(SUM(savings_usd),0) AS total_savings,
                    COUNT(*) FILTER (WHERE savings_usd > 0) AS alerts_with_savings
-            FROM fuel_alerts WHERE alerted_at >= %s AND alert_type = 'low_fuel'
+            FROM fuel_alerts WHERE alerted_at >= %s
         """, (week_ago,))
         stats = dict(cur.fetchone())
 
         cur.execute("""
             SELECT vehicle_name, COALESCE(SUM(savings_usd),0) AS saved, COUNT(*) AS alerts
-            FROM fuel_alerts WHERE alerted_at >= %s AND alert_type = 'low_fuel'
+            FROM fuel_alerts WHERE alerted_at >= %s
             GROUP BY vehicle_name ORDER BY saved DESC LIMIT 5
         """, (week_ago,))
         top_trucks = cur.fetchall()
@@ -1512,15 +1464,14 @@ def send_weekly_savings_report() -> None:
         # IFTA data — fuel purchased by state this week
         try:
             cur.execute("""
-                SELECT best_stop_state,
+                SELECT actual_stop_state,
                        COUNT(*) AS stops,
-                       COALESCE(SUM(gallons_purchased),0) AS total_gal,
-                       AVG(best_stop_price) AS avg_pump_price
-                FROM fuel_alerts
-                WHERE alerted_at >= %s
-                  AND alert_type = 'refueled'
-                  AND best_stop_state IS NOT NULL
-                GROUP BY best_stop_state
+                       COALESCE(SUM(gallons_purchased),0) AS total_gal
+                FROM stop_visits
+                WHERE visited_at >= %s
+                  AND actual_stop_state IS NOT NULL
+                  AND gallons_purchased > 0
+                GROUP BY actual_stop_state
                 ORDER BY total_gal DESC
                 LIMIT 8
             """, (week_ago,))
@@ -1533,7 +1484,7 @@ def send_weekly_savings_report() -> None:
             SELECT COUNT(*) AS total,
                    COUNT(*) FILTER (WHERE visited=TRUE)  AS visited,
                    COUNT(*) FILTER (WHERE visited=FALSE) AS skipped
-            FROM stop_visits WHERE created_at >= %s
+            FROM stop_visits WHERE visited_at >= %s
         """, (week_ago,))
         compliance = dict(cur.fetchone())
 
@@ -1575,10 +1526,11 @@ def send_weekly_savings_report() -> None:
                 "🚩 *Driver Accountability Flags:*",
             ]
             flag_icons = {
-                "WRONG_STOP":    "⛽ Wrong Stop",
-                "MISSED_STOP":   "🛣 Missed Stop",
-                "LOW_FUEL":      "🔋 Low Fuel Event",
+                "WRONG_STOP":     "⛽ Wrong Stop",
+                "MISSED_STOP":    "🛣 Missed Stop",
+                "LOW_FUEL":       "🔋 Low Fuel Event",
                 "LOW_STOP_STATE": "⚠️ Low-Stop State",
+                "UNPLANNED_STOP": "🚦 Unplanned Stop",
             }
             for flag_type, data in flag_summary.items():
                 label = flag_icons.get(flag_type, flag_type)
@@ -1607,37 +1559,31 @@ def send_weekly_savings_report() -> None:
     if ifta_by_state:
         try:
             from ifta import get_ifta_rate, HOME_STATE_RATE
-            total_pump     = 0.0
-            total_net      = 0.0
-            total_gal_all  = 0.0
-            ifta_lines     = []
+            total_gal_all = 0.0
+            total_adj     = 0.0
+            ifta_lines    = []
 
             for r in ifta_by_state:
-                state    = r["best_stop_state"] or "?"
+                state    = r["actual_stop_state"] or "?"
                 gal      = float(r["total_gal"] or 0)
-                avg_pump = float(r["avg_pump_price"] or 0)
                 rate     = get_ifta_rate(state)
                 net_rate = HOME_STATE_RATE - rate  # adjustment per gallon
                 adj_cost = net_rate * gal           # + means owe IN, - means credit
 
-                total_pump    += avg_pump * gal
-                total_net     += (avg_pump + net_rate) * gal
                 total_gal_all += gal
+                total_adj     += adj_cost
 
                 sign = "⚠️ owes IN" if net_rate > 0 else "✅ credit"
                 ifta_lines.append(
-                    f"   {state}: {gal:.0f} gal @ ${avg_pump:.3f} pump | "
-                    f"IFTA adj: ${net_rate:+.3f}/gal | {sign}"
+                    f"   {state}: {gal:.0f} gal | "
+                    f"IFTA adj: ${net_rate:+.3f}/gal = ${adj_cost:+.2f} | {sign}"
                 )
 
             lines += ifta_lines
-            ifta_diff = total_net - total_pump
             lines += [
                 "",
                 f"⛽ Total fuel purchased: *{total_gal_all:.0f} gal*",
-                f"💳 Total pump cost: *${total_pump:,.2f}*",
-                f"📋 IFTA settlement (est.): *${ifta_diff:+,.2f}*",
-                f"💵 *True net fuel cost: ${total_net:,.2f}*",
+                f"📋 IFTA settlement (est.): *${total_adj:+,.2f}*",
             ]
         except Exception as e:
             lines.append(f"   _(IFTA calculation error: {e})_")

@@ -46,9 +46,8 @@ from config import (
 )
 from yard_geofence import is_in_yard, get_yard_name
 from truck_stop_finder import (
-    find_best_stops, find_best_stops_on_route, calc_savings,
-    get_urgency, find_current_stop, haversine_miles,
-    find_emergency_stop, find_critical_radial_stop, gallons_to_fill,
+    find_best_stops,
+    find_current_stop, haversine_miles,
 )
 from california import (
     should_send_ca_reminder,
@@ -57,13 +56,9 @@ from california import (
     _dist_to_ca_border,
 )
 from telegram_bot import (
-    send_low_fuel_alert,
-    send_at_stop_alert,
     delete_message,
     send_ca_border_reminder,
     send_refueled_alert,
-    send_left_yard_low_fuel,
-    send_emergency_alert,
 )
 from database import (
     create_fuel_alert,
@@ -148,6 +143,11 @@ def _new_state(vid, data):
         "assigned_stop_min_dist":         None,
         "assigned_stop_fill_instruction": None,
         "pending_wrong_stop":             None,
+        "reminder_30_50_sent":            False,
+        "reminder_stop_name":             None,
+        "missed_stop_flagged_for":        None,
+        "at_stop_visit_id":               None,
+        "correct_stop_notified":          None,
     }
 
 
@@ -177,6 +177,11 @@ def _clear_alert(state):
     state["assigned_stop_min_dist"]         = None
     state["assigned_stop_fill_instruction"] = None
     state["pending_wrong_stop"]             = None
+    state["reminder_30_50_sent"]            = False
+    state["reminder_stop_name"]             = None
+    state["missed_stop_flagged_for"]        = None
+    state["at_stop_visit_id"]              = None
+    state["correct_stop_notified"]          = None
 
 
 def _get_truck_params(vehicle_name: str) -> tuple[float, float]:
@@ -358,6 +363,19 @@ def process_truck(vid, prev_state, current_data, truck_states):
                 state["assigned_stop_fill_instruction"] = None
 
             state["briefing_sent_trip"] = route_id
+
+            # Log to fuel_alerts so "Total Alerts Fired" in weekly report is accurate
+            if msg and plan.get("planned_stops"):
+                try:
+                    first_stop = plan["planned_stops"][0]
+                    create_fuel_alert(
+                        vid, vname, fuel, lat, lng, heading, speed,
+                        alert_type="route_briefing",
+                        best_stop=first_stop,
+                    )
+                except Exception as _ae:
+                    log.warning(f"  {vname}: fuel_alert save for briefing failed: {_ae}")
+
             try:
                 from database import save_trip_state
                 save_trip_state(vname, state)
@@ -478,7 +496,7 @@ def process_truck(vid, prev_state, current_data, truck_states):
                     is_recommended = visited
                     try:
                         from database import log_stop_visit
-                        log_stop_visit(
+                        visit_id = log_stop_visit(
                             vehicle_name=vname,
                             alert_id=state.get("open_alert_id"),
                             recommended_stop_name=rec_name,
@@ -490,6 +508,8 @@ def process_truck(vid, prev_state, current_data, truck_states):
                             visited=visited,
                             fuel_before=fuel, fuel_after=fuel,
                         )
+                        # Store ID so refuel detection can UPDATE this row with actual gallons
+                        state["at_stop_visit_id"] = visit_id
                         if visited:
                             log.info(f"  {vname}: ✅ entered RECOMMENDED stop {stop_name}")
                         else:
@@ -514,26 +534,30 @@ def process_truck(vid, prev_state, current_data, truck_states):
                     truck_group_cached = get_truck_group(vname)
 
                     if rec_name and is_recommended:
-                        # ✅ Driver is at the advised stop
-                        fill_instruction = (
-                            state.get("assigned_stop_fill_instruction")
-                            or "Full Tank Fill (200 Gallons)"
-                        )
-                        green_msg = "\n".join(filter(None, [
-                            f"✅ CORRECT STOP — TRUCK {vname}",
-                            "",
-                            stop_name,
-                            f"📌 {addr_line}" if addr_line else None,
-                            f"🗺️ [Directions]({maps_url})",
-                            f"⛽ Fuel: {fuel:.0f}%",
-                            f"💳 Card: ${card_price:.3f}/gal" if card_price else None,
-                            "",
-                            "💧 INSTRUCTIONS:",
-                            fill_instruction,
-                        ]))
-                        if truck_group_cached:
-                            _send_to(truck_group_cached, green_msg)
-                        _send_to_dispatcher(green_msg)
+                        # ✅ Driver is at the advised stop — send ONCE per assigned stop
+                        if state.get("correct_stop_notified") == rec_name:
+                            log.info(f"  {vname}: correct stop already notified for {rec_name} — skip duplicate")
+                        else:
+                            fill_instruction = (
+                                state.get("assigned_stop_fill_instruction")
+                                or "Full Tank Fill (200 Gallons)"
+                            )
+                            green_msg = "\n".join(filter(None, [
+                                f"✅ CORRECT STOP — TRUCK {vname}",
+                                "",
+                                stop_name,
+                                f"📌 {addr_line}" if addr_line else None,
+                                f"🗺️ [Directions]({maps_url})",
+                                f"⛽ Fuel: {fuel:.0f}%",
+                                f"💳 Card: ${card_price:.3f}/gal" if card_price else None,
+                                "",
+                                "💧 INSTRUCTIONS:",
+                                fill_instruction,
+                            ]))
+                            if truck_group_cached:
+                                _send_to(truck_group_cached, green_msg)
+                            _send_to_dispatcher(green_msg)
+                            state["correct_stop_notified"] = rec_name
 
                     elif not rec_name:
                         # No planned stop — neutral entry notification to dispatcher only
@@ -614,10 +638,11 @@ def process_truck(vid, prev_state, current_data, truck_states):
                 if state.get("pending_wrong_stop") and fuel <= fuel_at_entry + _REFUEL_PCT:
                     log.info(f"  {vname}: pending wrong-stop cleared — left {stop_name_left} without refueling")
                     state["pending_wrong_stop"] = None
-            state["at_stop_id"]    = None
-            state["at_stop_name"]  = None
-            state["at_stop_since"] = None
-            state["at_stop_fuel"]  = None
+            state["at_stop_id"]       = None
+            state["at_stop_name"]     = None
+            state["at_stop_since"]    = None
+            state["at_stop_fuel"]     = None
+            state["at_stop_visit_id"] = None
     except Exception as e:
         log.warning(f"  {vname}: geofence check failed: {e}")
 
@@ -641,10 +666,6 @@ def process_truck(vid, prev_state, current_data, truck_states):
         yard_name = state.get("yard_name", "yard")
         log.info(f"  {vname}: left {yard_name} at {fuel:.1f}% fuel")
         state.update({"in_yard": False, "yard_name": None})
-        if fuel <= FUEL_ALERT_THRESHOLD_PCT:
-            send_left_yard_low_fuel(vname, fuel, yard_name)
-            _fire_alert(vid, state, current_data, tank_gal, mpg, state_code="")
-            return
 
     # ══════════════════════════════════════════════════════════════════════════
     # 2. CALIFORNIA BORDER REMINDER (checked every poll, independent of fuel)
@@ -780,6 +801,31 @@ def process_truck(vid, prev_state, current_data, truck_states):
             _fire_ca_reminder(state, current_data, tank_gal, mpg, state_code=state_code or "")
 
     # ══════════════════════════════════════════════════════════════════════════
+    # 2b. 30-50 MILE REMINDER — warn driver once when approaching assigned stop
+    # ══════════════════════════════════════════════════════════════════════════
+    _asgn_lat  = state.get("assigned_stop_lat")
+    _asgn_lng  = state.get("assigned_stop_lng")
+    _asgn_name = state.get("assigned_stop_name")
+    if _asgn_lat and _asgn_lng and _asgn_name and moving:
+        if state.get("reminder_stop_name") != _asgn_name:
+            state["reminder_30_50_sent"] = False
+            state["reminder_stop_name"]  = _asgn_name
+        if not state.get("reminder_30_50_sent"):
+            _dist_asgn = haversine_miles(lat, lng, float(_asgn_lat), float(_asgn_lng))
+            if 30.0 <= _dist_asgn <= 50.0:
+                try:
+                    from telegram_bot import _send_to_truck
+                    _rem_msg = (
+                        f"⚠️ REMINDER: You are {_dist_asgn:.0f} miles away from your "
+                        f"assigned fuel stop at {_asgn_name}. Please do not miss this stop!"
+                    )
+                    _send_to_truck(vname, _rem_msg)
+                    state["reminder_30_50_sent"] = True
+                    log.info(f"  {vname}: 30-50mi reminder sent — {_dist_asgn:.0f}mi to {_asgn_name}")
+                except Exception as _re:
+                    log.warning(f"  {vname}: 30-50mi reminder failed: {_re}")
+
+    # ══════════════════════════════════════════════════════════════════════════
     # 3. FUEL IS FINE
     # ══════════════════════════════════════════════════════════════════════════
     if fuel > FUEL_ALERT_THRESHOLD_PCT:
@@ -803,81 +849,24 @@ def process_truck(vid, prev_state, current_data, truck_states):
         return
 
     # ══════════════════════════════════════════════════════════════════════════
-    # 3b. 40% LOW FUEL TRIGGER — re-verify plan and fire alert
-    #     Per V2 spec: at 40% fuel, re-verify the plan and send Low Fuel Alert
-    #     to Dispatcher and Driver groups with Google Maps link.
+    # 3b. 40% LOW FUEL — log silently to DB for weekly report only
     # ══════════════════════════════════════════════════════════════════════════
     if fuel <= FUEL_ALERT_THRESHOLD_PCT and not state.get("low_fuel_flagged"):
-        log.info(f"  {vname}: 40% fuel trigger — re-verifying plan")
         try:
             from flag_system import flag_low_fuel
             from database import get_truck_group
-            truck_group = get_truck_group(vname)
-            planned_stop = state.get("assigned_stop_name")
             flag_low_fuel(
                 vehicle_name=vname,
-                truck_group_id=truck_group,
+                truck_group_id=get_truck_group(vname),
                 fuel_pct=fuel,
                 truck_lat=lat,
                 truck_lng=lng,
-                planned_stop_name=planned_stop,
+                planned_stop_name=state.get("assigned_stop_name"),
             )
             state["low_fuel_flagged"] = True
-
-            # Emergency reachability check — can truck reach planned stop?
-            planned_lat = state.get("assigned_stop_lat")
-            planned_lng = state.get("assigned_stop_lng")
-            if planned_lat and planned_lng:
-                range_miles = (fuel / 100) * tank_gal * mpg * 0.85
-                dist_to_planned = haversine_miles(
-                    lat, lng, float(planned_lat), float(planned_lng)
-                )
-                if range_miles < dist_to_planned:
-                    log.warning(
-                        f"  {vname}: EMERGENCY — can't reach planned stop "
-                        f"{state.get('assigned_stop_name')} "
-                        f"({dist_to_planned:.0f}mi away, range={range_miles:.0f}mi)"
-                    )
-                    # Find next-best reachable stop — cheapest within actual range
-                    best = find_emergency_stop(
-                        truck_lat=lat, truck_lng=lng,
-                        truck_heading=heading,
-                        fuel_pct=fuel,
-                        tank_gal=tank_gal,
-                        mpg=mpg,
-                        range_budget_miles=range_miles,
-                        truck_state=state_code or "",
-                    )
-                    if best:
-                        old_name = state.get("assigned_stop_name")
-                        state["assigned_stop_name"] = best["store_name"]
-                        state["assigned_stop_lat"]  = float(best["latitude"])
-                        state["assigned_stop_lng"]  = float(best["longitude"])
-                        state["assigned_stop_card_price"] = best.get("diesel_price")
-                        log.info(
-                            f"  {vname}: reassigned to reachable stop "
-                            f"{best['store_name']} (was {old_name})"
-                        )
-                        # Fire emergency alert with new stop
-                        result = send_emergency_alert(
-                            vehicle_name=vname,
-                            fuel_pct=fuel,
-                            truck_lat=lat,
-                            truck_lng=lng,
-                            heading=heading,
-                            speed_mph=speed,
-                            best_stop=best,
-                            planned_stop_name=old_name,
-                            range_miles=range_miles,
-                            gps_stale=current_data.get("gps_stale", False),
-                        )
-                        if isinstance(result, dict):
-                            state["prev_truck_group"]  = result.get("truck_group")
-                            state["prev_truck_msg_id"] = result.get("truck_msg_id")
-                            state["prev_dispatcher_msg_id"] = result.get("dispatcher_msg_id")
-                        state["alert_sent"] = True
+            log.info(f"  {vname}: 40% trigger — logged to DB (no alert sent)")
         except Exception as lfe:
-            log.warning(f"  {vname}: low fuel flag failed: {lfe}")
+            log.warning(f"  {vname}: low fuel DB log failed: {lfe}")
 
     # ══════════════════════════════════════════════════════════════════════════
     # 4. FUEL IS LOW
@@ -936,9 +925,14 @@ def process_truck(vid, prev_state, current_data, truck_states):
                                           float(rec_lat), float(rec_lng))
             is_planned  = dist_to_rec <= 2.0
 
-        # ── UNPLANNED REFUEL — driver fueled without bot knowing ─────────────
+        # ── Calculate savings_usd for this refuel ────────────────────────────
+        # Savings = (retail price - fleet card price) × gallons at the stop used
+        _savings_usd = None
+        if actual_stop and card_price and retail and retail > card_price and gallons_added > 0:
+            _savings_usd = round((retail - card_price) * gallons_added, 2)
+
+        # ── UNPLANNED REFUEL — driver fueled without a bot-assigned stop ──────
         if not rec_name:
-            # No planned stop — driver fueled on their own (rest stop, etc.)
             total_paid = round(card_price * gallons_added, 2) if card_price else 0
             msg = (
                 f"⛽ *Unplanned Refuel Detected — Truck {vname}*\n"
@@ -946,7 +940,7 @@ def process_truck(vid, prev_state, current_data, truck_states):
                 f"📍 *{actual_name}*\n"
             )
             if actual_stop:
-                city  = actual_stop.get("city", "")
+                city       = actual_stop.get("city", "")
                 state_code = actual_stop.get("state", "")
                 msg += f"📌 {city}, {state_code}\n"
             if card_price:
@@ -958,7 +952,6 @@ def process_truck(vid, prev_state, current_data, truck_states):
                 msg += f" = *${total_paid:.0f}*"
             msg += "\n\n📋 Logged. Route plan updated."
 
-            # Send to dispatcher only — informational, not a flag
             from telegram_bot import _send_to_dispatcher, _send_to
             from database import get_truck_group
             truck_group = get_truck_group(vname)
@@ -968,21 +961,57 @@ def process_truck(vid, prev_state, current_data, truck_states):
             log.info(f"  {vname}: unplanned refuel at {actual_name} "
                      f"({prev_fuel:.0f}%→{fuel:.0f}%, ~{gallons_added:.0f}gal)")
 
-        else:
-            # ── PLANNED REFUEL — check if right or wrong stop ────────────────
+            # Save to stop_visits for IFTA / weekly report
             try:
                 from database import log_stop_visit
                 log_stop_visit(
                     vehicle_name=vname,
-                    alert_id=state.get("open_alert_id"),
-                    recommended_stop_name=rec_name,
-                    recommended_lat=rec_lat, recommended_lng=rec_lng,
+                    alert_id=None,
+                    recommended_stop_name=None,
+                    recommended_lat=None, recommended_lng=None,
                     actual_stop_name=actual_name,
                     actual_lat=actual_lat, actual_lng=actual_lng,
                     actual_stop_state=actual_stop.get("state") if actual_stop else None,
-                    visited=is_planned,
+                    visited=None,
                     fuel_before=prev_fuel, fuel_after=fuel,
+                    gallons_purchased=gallons_added,
+                    savings_usd=_savings_usd,
                 )
+            except Exception as e:
+                log.warning(f"  {vname}: unplanned refuel DB log failed: {e}")
+
+        else:
+            # ── PLANNED REFUEL — check if right or wrong stop ────────────────
+            try:
+                from database import log_stop_visit, update_stop_visit_refuel
+                visit_id = state.get("at_stop_visit_id")
+                if visit_id:
+                    # UPDATE the geofence-entry row created in section 0c
+                    update_stop_visit_refuel(
+                        visit_id=visit_id,
+                        fuel_after=fuel,
+                        gallons_purchased=gallons_added,
+                        actual_stop_state=actual_stop.get("state") if actual_stop else None,
+                        savings_usd=_savings_usd,
+                    )
+                    state["at_stop_visit_id"] = None
+                    log.info(f"  {vname}: stop_visit {visit_id} updated with refuel data")
+                else:
+                    # No geofence entry row — insert fresh (truck refueled at unknown stop)
+                    log_stop_visit(
+                        vehicle_name=vname,
+                        alert_id=state.get("open_alert_id"),
+                        recommended_stop_name=rec_name,
+                        recommended_lat=rec_lat, recommended_lng=rec_lng,
+                        actual_stop_name=actual_name,
+                        actual_lat=actual_lat, actual_lng=actual_lng,
+                        actual_stop_state=actual_stop.get("state") if actual_stop else None,
+                        visited=is_planned,
+                        fuel_before=prev_fuel, fuel_after=fuel,
+                        gallons_purchased=gallons_added,
+                        savings_usd=_savings_usd,
+                    )
+
                 if is_planned:
                     log.info(f"  {vname}: ✅ visited recommended stop {rec_name}")
                     state["pending_wrong_stop"] = None
@@ -1121,13 +1150,11 @@ def process_truck(vid, prev_state, current_data, truck_states):
             "sleeping": False, "fuel_when_parked": None,
             "parked_since": None, "last_alerted_fuel": None,
         })
-        # Fresh alert with current heading
         if state.get("open_alert_id"):
             resolve_alert(state["open_alert_id"])
         _clear_alert(state)
         state["state"]     = "CRITICAL_MOVING"
         state["next_poll"] = _next_poll(POLL_INTERVAL_CRITICAL_MOVING)
-        _fire_alert(vid, state, current_data, tank_gal, mpg, state_code=state_code or "")
         return
 
     # ── 4c. MOVING + LOW FUEL ─────────────────────────────────────────────────
@@ -1136,33 +1163,6 @@ def process_truck(vid, prev_state, current_data, truck_states):
         state["next_poll"]    = _next_poll(POLL_INTERVAL_CRITICAL_MOVING)
         state["parked_since"] = None
         state["sleeping"]     = False
-
-        current_urgency = get_urgency(fuel)
-        last_urgency    = state.get("last_alert_urgency")
-        urgency_order   = {"ADVISORY": 0, "WARNING": 1, "CRITICAL": 2, "EMERGENCY": 3}
-
-        tier_escalated = (
-            last_urgency is not None and
-            urgency_order.get(current_urgency, 0) > urgency_order.get(last_urgency, 0)
-        )
-
-        # Time since last alert
-        last_alert_time = _tz(state.get("last_alert_time"))
-        minutes_since   = (
-            (_utcnow() - last_alert_time).total_seconds() / 60
-            if last_alert_time else 9999
-        )
-        # 30% - 20%: every 30 min | 20% - 10%: every 10 min
-        # 35-20%: alert every 20 min | below 20%: alert every 10 min
-        time_threshold  = 10 if fuel <= 20 else 20
-        time_elapsed    = minutes_since >= time_threshold
-
-        # Fuel drop since last alert
-        last_alert_fuel = state.get("last_alert_fuel")
-        fuel_dropped    = (
-            last_alert_fuel is not None and
-            fuel <= last_alert_fuel - _ALERT_FUEL_DROP
-        )
 
         # Check if truck passed its assigned stop without stopping
         passed_assigned_stop = False
@@ -1187,51 +1187,50 @@ def process_truck(vid, prev_state, current_data, truck_states):
             emergency_check = state.get("alert_sent") and dist_to_stop > 5 and minutes_since_assign > 10
             if (was_near_stop and dist_to_stop > 10) or emergency_check:
                 passed_assigned_stop = True
-                log.info(f"  {vname}: passed assigned stop ({dist_to_stop:.1f} mi away, min was {min_dist_so_far:.1f} mi) — finding next stop")
-                # Flag missed stop
-                try:
-                    from flag_system import flag_missed_stop
-                    from database import get_truck_group
-                    truck_group = get_truck_group(vname)
-                    # Get card price from planned stop if available
-                    planned_stops = state.get("all_planned_stops", [])
-                    planned_idx   = state.get("planned_stop_index", 0)
-                    card_price    = None
-                    if planned_stops and planned_idx < len(planned_stops):
-                        ps         = planned_stops[planned_idx]
-                        card_price = ps.get("card_price") or ps.get("diesel_price")
-                    # Fallback — use last known stop price from state
-                    if not card_price:
-                        card_price = state.get("assigned_stop_card_price")
-
-                    # Get net_price (IFTA-adjusted) from planned stop
-                    net_price = None
-                    if planned_stops and planned_idx < len(planned_stops):
-                        ps        = planned_stops[planned_idx]
-                        net_price = ps.get("net_price")
-                    if net_price is None:
-                        net_price = state.get("assigned_stop_net_price")
-
-                    flag_missed_stop(
-                        vehicle_name=vname,
-                        truck_group_id=truck_group,
-                        stop_name=state.get("assigned_stop_name", "Unknown"),
-                        dist_past=dist_to_stop,
-                        fuel_pct=fuel,
-                        tank_gal=tank_gal,
-                        card_price=card_price,
-                        net_price=net_price,
-                    )
-                    # Save for real loss calculation when driver fuels elsewhere
-                    state["missed_stop_name"]       = state.get("assigned_stop_name")
-                    state["missed_stop_card_price"] = card_price
-                    state["missed_stop_net_price"]  = net_price
+                _stop_to_flag = state.get("assigned_stop_name", "Unknown")
+                log.info(f"  {vname}: passed assigned stop ({dist_to_stop:.1f} mi away, min was {min_dist_so_far:.1f} mi)")
+                # Flag missed stop — fires ONCE per assigned stop name
+                if state.get("missed_stop_flagged_for") == _stop_to_flag:
+                    log.info(f"  {vname}: missed stop already flagged for {_stop_to_flag} — skip")
+                else:
                     try:
-                        from database import save_trip_state
-                        save_trip_state(vname, state)
-                    except Exception: pass
-                except Exception as fe:
-                    log.warning(f"  {vname}: flag_missed_stop failed: {fe}")
+                        from flag_system import flag_missed_stop
+                        from database import get_truck_group
+                        truck_group   = get_truck_group(vname)
+                        planned_stops = state.get("all_planned_stops", [])
+                        planned_idx   = state.get("planned_stop_index", 0)
+                        card_price    = None
+                        net_price     = None
+                        if planned_stops and planned_idx < len(planned_stops):
+                            ps         = planned_stops[planned_idx]
+                            card_price = ps.get("card_price") or ps.get("diesel_price")
+                            net_price  = ps.get("net_price")
+                        if not card_price:
+                            card_price = state.get("assigned_stop_card_price")
+                        if net_price is None:
+                            net_price = state.get("assigned_stop_net_price")
+
+                        flag_missed_stop(
+                            vehicle_name=vname,
+                            truck_group_id=truck_group,
+                            stop_name=_stop_to_flag,
+                            dist_past=dist_to_stop,
+                            fuel_pct=fuel,
+                            tank_gal=tank_gal,
+                            card_price=card_price,
+                            net_price=net_price,
+                        )
+                        state["missed_stop_flagged_for"] = _stop_to_flag
+                        state["missed_stop_name"]        = _stop_to_flag
+                        state["missed_stop_card_price"]  = card_price
+                        state["missed_stop_net_price"]   = net_price
+                        try:
+                            from database import save_trip_state
+                            save_trip_state(vname, state)
+                        except Exception:
+                            pass
+                    except Exception as fe:
+                        log.warning(f"  {vname}: flag_missed_stop failed: {fe}")
                 # Advance to next planned stop
                 all_planned  = state.get("all_planned_stops", [])
                 current_idx  = state.get("planned_stop_index", 0)
@@ -1286,34 +1285,7 @@ def process_truck(vid, prev_state, current_data, truck_states):
                     save_trip_state(vname, state)
                 except Exception: pass
 
-        should_alert = (
-            not state.get("alert_sent")
-            or tier_escalated
-            or time_elapsed
-            or fuel_dropped
-            or passed_assigned_stop
-        )
-
-        if should_alert:
-            if state.get("alert_sent"):
-                if passed_assigned_stop:
-                    reason = "passed assigned stop"
-                elif tier_escalated:
-                    reason = f"tier {last_urgency}→{current_urgency}"
-                elif fuel_dropped:
-                    reason = f"fuel dropped {last_alert_fuel:.0f}%→{fuel:.0f}%"
-                else:
-                    reason = f"{minutes_since:.0f}min since last alert"
-                log.info(f"  {vname}: re-alert — {reason}")
-            _fire_alert(vid, state, current_data, tank_gal, mpg, state_code=state_code or "")
-            state["last_alert_urgency"] = current_urgency
-            state["last_alert_time"]    = _utcnow()
-            state["last_alert_lat"]     = lat
-            state["last_alert_lng"]     = lng
-            state["last_alert_fuel"]    = fuel
-        else:
-            log.info(f"  {vname}: moving, skipping alert — "
-                     f"{minutes_since:.0f}min ago, urgency={current_urgency}")
+        log.info(f"  {vname}: moving low fuel — no alert sent (plan already dispatched)")
         return
 
     # ── 4d. PARKED + LOW FUEL ─────────────────────────────────────────────────
@@ -1350,154 +1322,7 @@ def process_truck(vid, prev_state, current_data, truck_states):
         else POLL_INTERVAL_CRITICAL_PARKED
     )
 
-    already_alerted = state.get("overnight_alert_sent", False)
-
-    moved_since_alert = 0.0
-    if last_park_lat and last_park_lng:
-        moved_since_alert = haversine_miles(last_park_lat, last_park_lng, lat, lng)
-    location_changed = moved_since_alert >= _PARKED_MOVE_MI
-
-    # Re-alert only on first park or when truck moves to a new spot.
-    # Do NOT re-alert on fuel drop alone — driver may be sleeping.
-    if not already_alerted or location_changed:
-        if already_alerted:
-            log.info(f"  {vname}: parked re-alert — moved {moved_since_alert:.1f}mi")
-        _fire_alert(vid, state, current_data, tank_gal, mpg, state_code=state_code or "")
-        state["overnight_alert_sent"] = True
-        state["last_alerted_fuel"]    = fuel
-        state["last_alert_lat"]       = lat
-        state["last_alert_lng"]       = lng
-    else:
-        log.info(f"  {vname}: parked, skipping — same spot, waiting for truck to roll")
-
-
-# -- Alert firing -------------------------------------------------------------
-
-def _fire_alert(vid, state, data, tank_gal, mpg, state_code=""):
-    """
-    EMERGENCY ONLY alert system.
-
-    Normal low fuel alerts removed — driver already has the route briefing
-    with all planned stops. Only fires when:
-      1. Truck cannot reach the planned stop on current fuel
-      2. Fuel drops below 15% with no plan
-      3. Truck is parked at a fuel stop (at-stop reminder)
-    """
-    vname   = data["vehicle_name"]
-    fuel    = data["fuel_pct"]
-    lat     = data["lat"]
-    lng     = data["lng"]
-    speed   = data["speed_mph"]
-    heading = data["heading"]
-
-    # Correct heading from movement
-    prev_lat = state.get("lat")
-    prev_lng = state.get("lng")
-    if (prev_lat and prev_lng and speed > 10 and
-            (abs(lat - prev_lat) > 0.001 or abs(lng - prev_lng) > 0.001)):
-        from truck_stop_finder import bearing as calc_bearing
-        heading = calc_bearing(prev_lat, prev_lng, lat, lng)
-
-    # ── Case 1: Truck is AT a fuel stop — send at-stop reminder ──────────────
-    current_stop = find_current_stop(lat, lng) if speed < 3 else None
-    if current_stop:
-        log.info(f"  {vname}: at stop {current_stop['store_name']} — at-stop alert")
-        result = send_at_stop_alert(vname, fuel, lat, lng, current_stop)
-        if isinstance(result, dict):
-            state["prev_truck_group"]       = result.get("truck_group")
-            state["prev_truck_msg_id"]      = result.get("truck_msg_id")
-            state["prev_dispatcher_msg_id"] = result.get("dispatcher_msg_id")
-        state["alert_sent"] = True
-        return
-
-    # ── Case 2: Check if truck can reach planned stop ─────────────────────────
-    planned_stop_name = state.get("assigned_stop_name")
-    planned_stop_lat  = state.get("assigned_stop_lat")
-    planned_stop_lng  = state.get("assigned_stop_lng")
-    range_miles       = (fuel / 100) * tank_gal * mpg * 0.85
-
-    if planned_stop_lat and planned_stop_lng:
-        dist_to_planned = haversine_miles(lat, lng,
-                                          float(planned_stop_lat),
-                                          float(planned_stop_lng))
-        if range_miles >= dist_to_planned:
-            # ✅ Still on track — no emergency
-            log.info(f"  {vname}: on track to {planned_stop_name} "
-                     f"({dist_to_planned:.0f}mi), range={range_miles:.0f}mi — no alert")
-            return
-
-    # ── Case 3: EMERGENCY — can't reach planned stop or fuel <= 20% ──────────
-    log.warning(f"  {vname}: EMERGENCY — fuel={fuel:.0f}% range={range_miles:.0f}mi")
-
-    # NOTE: We do NOT delete previous messages from driver chat
-    # All alerts stay visible in chat history for accountability
-
-    # At ≤20% fuel: pure radial search (50mi, no directional/CA filters, nearest wins)
-    # Above 20%: price-optimised search within actual range budget
-    if fuel <= 20:
-        log.warning(f"  {vname}: CRITICAL override ≤20% — radial 50mi search, no filters")
-        best = find_critical_radial_stop(truck_lat=lat, truck_lng=lng, radius_miles=50.0)
-        if best is None:
-            # Widen to 100mi if nothing in 50
-            best = find_critical_radial_stop(truck_lat=lat, truck_lng=lng, radius_miles=100.0)
-    else:
-        best = find_emergency_stop(
-            truck_lat=lat, truck_lng=lng,
-            truck_heading=heading,
-            fuel_pct=fuel,
-            tank_gal=tank_gal,
-            mpg=mpg,
-            range_budget_miles=range_miles,
-            truck_state=state_code or "",
-        )
-
-    # Log to DB
-    alert_id = create_fuel_alert(
-        vid, vname, fuel, lat, lng, heading, speed,
-        alert_type="emergency",
-        best_stop=best, alt_stop=None, savings_usd=None,
-    )
-    state["open_alert_id"] = alert_id
-
-    if best:
-        state["assigned_stop_name"] = best["store_name"]
-        state["assigned_stop_lat"]  = float(best["latitude"])
-        state["assigned_stop_lng"]  = float(best["longitude"])
-        state["assignment_time"]    = _utcnow()
-
-    # Delete previous emergency alert before sending new one
-    prev_emg_truck      = state.get("prev_emergency_truck_msg_id")
-    prev_emg_dispatcher = state.get("prev_emergency_dispatcher_msg_id")
-    prev_truck_group    = state.get("prev_truck_group")
-
-    if prev_truck_group and prev_emg_truck:
-        delete_message(prev_truck_group, prev_emg_truck)
-    if prev_emg_dispatcher:
-        delete_message(str(DISPATCHER_GROUP_ID), prev_emg_dispatcher)
-
-    # Send emergency alert
-    result = send_emergency_alert(
-        vehicle_name=vname,
-        fuel_pct=fuel,
-        truck_lat=lat,
-        truck_lng=lng,
-        heading=heading,
-        speed_mph=speed,
-        best_stop=best,
-        planned_stop_name=planned_stop_name,
-        range_miles=range_miles,
-        gps_stale=data.get("gps_stale", False),
-    )
-
-    if isinstance(result, dict):
-        state["prev_truck_group"]                = result.get("truck_group")
-        state["prev_emergency_truck_msg_id"]     = result.get("truck_msg_id")
-        state["prev_emergency_dispatcher_msg_id"] = result.get("dispatcher_msg_id")
-        # Keep old keys for compatibility
-        state["prev_truck_msg_id"]      = result.get("truck_msg_id")
-        state["prev_dispatcher_msg_id"] = result.get("dispatcher_msg_id")
-
-    state["alert_sent"] = True
+    log.info(f"  {vname}: parked at {fuel:.0f}% — low fuel, waiting for truck to roll")
 
 
 def _fire_ca_reminder(state, data, tank_gal, mpg, state_code=""):

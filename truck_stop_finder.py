@@ -478,6 +478,12 @@ def find_best_stops(
             truck_lat, truck_lng, truck_heading or 0, slat, slng
         ) if not parked else 0.0
 
+        if not parked and urgency not in ("CRITICAL", "EMERGENCY"):
+            if not ahead:
+                continue
+            if detour_mi > 25.0:
+                continue
+
         fill_gal  = gallons_to_fill(fuel_pct, tank_gal)
         fill_cost = (stop["diesel_price"] or 0) * fill_gal
         tc        = true_cost(stop, truck_lat, truck_lng,
@@ -502,7 +508,7 @@ def find_best_stops(
         else:
             score = dist
 
-        if not ahead and urgency not in ("EMERGENCY", "CRITICAL"):
+        if not ahead:
             score += BEHIND_PENALTY_MILES * (stop.get("diesel_price") or 4.0)
 
         candidates.append({
@@ -533,12 +539,14 @@ def find_best_stops(
                 if not parked and truck_heading is not None:
                     bear  = bearing(truck_lat, truck_lng, slat, slng)
                     ahead = angle_diff(truck_heading, bear) <= _AHEAD_ARC_DEGREES
+                if not parked and not ahead and urgency not in ("CRITICAL", "EMERGENCY"):
+                    continue
                 detour_mi = perpendicular_distance(truck_lat, truck_lng, truck_heading or 0, slat, slng) if not parked else 0.0
                 fill_gal  = gallons_to_fill(fuel_pct, tank_gal)
                 fill_cost = (stop["diesel_price"] or 0) * fill_gal
                 tc        = true_cost(stop, truck_lat, truck_lng, truck_heading or 0, fuel_pct, tank_gal, mpg)
-                score     = dist if not ahead else (tc if price_matters else dist)
-                if not ahead and urgency not in ("EMERGENCY", "CRITICAL"):
+                score     = tc if (ahead and price_matters) else dist
+                if not ahead:
                     score += BEHIND_PENALTY_MILES * (stop.get("diesel_price") or 4.0)
                 candidates.append({
                     **stop,
@@ -620,8 +628,9 @@ def find_best_stops_on_route(
     if not all_stops:
         return None, None
 
-    urgency    = get_urgency(fuel_pct)
-    max_range  = reachable_miles(fuel_pct, tank_gal, mpg)
+    urgency     = get_urgency(fuel_pct)
+    max_range   = reachable_miles(fuel_pct, tank_gal, mpg)
+    max_cross   = 25.0 if urgency not in ("CRITICAL", "EMERGENCY") else 50.0
     truck_in_ca = False  # will be set by caller if needed
 
     # V2: Search radius should be the entire reachable range for True Cost search
@@ -711,7 +720,7 @@ def find_best_stops_on_route(
                 along = dist_from_seg_start * math.cos(math.radians(adiff))
                 cross = abs(dist_from_seg_start * math.sin(math.radians(adiff)))
 
-                if along > 0 and adiff <= 90 and cross <= 50.0 and along <= seg_dist * 1.1:
+                if along > 0 and adiff <= 90 and cross <= max_cross and along <= seg_dist * 1.1:
                     on_route = True
                     min_cross = min(min_cross, cross)
                     break

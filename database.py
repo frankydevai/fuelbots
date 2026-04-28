@@ -912,20 +912,12 @@ def log_stop_visit(vehicle_name: str, alert_id: int,
                    fuel_before: float, fuel_after: float,
                    actual_stop_state: str = None,
                    gallons_purchased: float = None,
-                   savings_usd: float = None) -> None:
-    """Log whether truck visited the recommended stop or went elsewhere."""
+                   savings_usd: float = None) -> int:
+    """Insert a stop visit row. Returns the new row ID."""
     from datetime import datetime, timezone
     if gallons_purchased is None and fuel_before is not None and fuel_after is not None:
         fuel_delta = max(float(fuel_after) - float(fuel_before), 0.0)
         gallons_purchased = round(150.0 * fuel_delta / 100.0, 1) if fuel_delta > 0 else 0.0
-    if savings_usd is None and visited and alert_id:
-        try:
-            with db_cursor() as cur:
-                cur.execute("SELECT savings_usd FROM fuel_alerts WHERE id = %s", (alert_id,))
-                row = cur.fetchone()
-                savings_usd = float(row["savings_usd"]) if row and row.get("savings_usd") is not None else None
-        except Exception:
-            savings_usd = None
     with db_cursor() as cur:
         cur.execute("""
             INSERT INTO stop_visits (
@@ -934,6 +926,7 @@ def log_stop_visit(vehicle_name: str, alert_id: int,
                 actual_stop_name, actual_stop_lat, actual_stop_lng, actual_stop_state,
                 visited, fuel_before, fuel_after, gallons_purchased, savings_usd, visited_at
             ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            RETURNING id
         """, (
             vehicle_name, alert_id,
             recommended_stop_name, recommended_lat, recommended_lng,
@@ -941,6 +934,26 @@ def log_stop_visit(vehicle_name: str, alert_id: int,
             visited, fuel_before, fuel_after, gallons_purchased, savings_usd,
             datetime.now(timezone.utc)
         ))
+        return cur.fetchone()["id"]
+
+
+def update_stop_visit_refuel(
+    visit_id: int,
+    fuel_after: float,
+    gallons_purchased: float,
+    actual_stop_state: str = None,
+    savings_usd: float = None,
+) -> None:
+    """Update an existing stop_visit row with actual refuel data (gallons, fuel_after)."""
+    with db_cursor() as cur:
+        cur.execute("""
+            UPDATE stop_visits SET
+                fuel_after        = %s,
+                gallons_purchased = %s,
+                actual_stop_state = COALESCE(%s, actual_stop_state),
+                savings_usd       = COALESCE(%s, savings_usd)
+            WHERE id = %s
+        """, (fuel_after, gallons_purchased, actual_stop_state, savings_usd, visit_id))
 
 
 def log_driver_flag(
@@ -1006,7 +1019,7 @@ def get_stop_compliance(vehicle_name: str = None, days: int = 7) -> list:
                 SELECT vehicle_name, recommended_stop_name, actual_stop_name,
                        visited, fuel_before, fuel_after, visited_at
                 FROM stop_visits
-                WHERE vehicle_name = %s AND created_at >= %s
+                WHERE vehicle_name = %s AND visited_at >= %s
                 ORDER BY visited_at DESC LIMIT 20
             """, (vehicle_name, since))
         else:
@@ -1016,7 +1029,7 @@ def get_stop_compliance(vehicle_name: str = None, days: int = 7) -> list:
                     COUNT(*) FILTER (WHERE visited = TRUE)  AS visited,
                     COUNT(*) FILTER (WHERE visited = FALSE) AS skipped,
                     COUNT(*) FILTER (WHERE visited IS NULL) AS unknown
-                FROM stop_visits WHERE created_at >= %s
+                FROM stop_visits WHERE visited_at >= %s
             """, (since,))
         return cur.fetchall()
 
