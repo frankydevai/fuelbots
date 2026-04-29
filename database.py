@@ -316,6 +316,7 @@ def init_db():
         ("savings_usd",        "REAL"),
     ]:
         cur.execute(f"ALTER TABLE stop_visits ADD COLUMN IF NOT EXISTS {col} {coltype}")
+    cur.execute("ALTER TABLE trucks ADD COLUMN IF NOT EXISTS telegram_group_name TEXT")
     conn.commit()
     conn.close()
     log.info("✅ Database schema ready.")
@@ -410,12 +411,18 @@ def get_truck_by_group(group_id: str) -> dict | None:
         return cur.fetchone()
 
 
-def upsert_truck_group(vehicle_name: str, group_id: str) -> bool:
+def upsert_truck_group(vehicle_name: str, group_id: str, group_name: str = None) -> bool:
     with db_cursor() as cur:
-        cur.execute(
-            "UPDATE trucks SET telegram_group_id = %s WHERE vehicle_name = %s",
-            (group_id, vehicle_name)
-        )
+        if group_name:
+            cur.execute(
+                "UPDATE trucks SET telegram_group_id = %s, telegram_group_name = %s WHERE vehicle_name = %s",
+                (group_id, group_name, vehicle_name)
+            )
+        else:
+            cur.execute(
+                "UPDATE trucks SET telegram_group_id = %s WHERE vehicle_name = %s",
+                (group_id, vehicle_name)
+            )
         return cur.rowcount > 0
 
 

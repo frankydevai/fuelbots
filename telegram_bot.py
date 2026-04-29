@@ -1352,16 +1352,22 @@ def _handle_truckstats(text: str, chat_id: str) -> None:
 
 
 def _handle_updategroup(text: str, chat_id: str) -> None:
-    """/updategroup <truck_name> — link this group to a truck. Bot reads group ID automatically."""
+    """/updategroup <truck_name> — link this group to a truck. Saves group ID and group name automatically."""
     from database import upsert_truck_group
     parts = text.strip().split()
     if len(parts) < 2:
         _send_to(chat_id, "Usage: `/updategroup 0792`\nBot will automatically assign this group to truck 0792.")
         return
     name = parts[1].strip()
-    if upsert_truck_group(name, chat_id):
-        _send_to(chat_id, f"✅ *Group assigned to Truck {name}*\nThis group will now receive fuel alerts for truck *{name}*.")
-        _send_to(ADMIN_CHAT_ID, f"🔄 *Group updated via /updategroup*\nTruck: *{name}*\nNew group ID: `{chat_id}`")
+    # Auto-fetch the Telegram group title
+    group_name = None
+    chat_info = _post("getChat", {"chat_id": chat_id})
+    if chat_info and chat_info.get("ok"):
+        group_name = chat_info.get("result", {}).get("title")
+    if upsert_truck_group(name, chat_id, group_name):
+        name_line = f"\nGroup name: *{group_name}*" if group_name else ""
+        _send_to(chat_id, f"✅ *Group assigned to Truck {name}*{name_line}\nThis group will now receive fuel alerts for truck *{name}*.")
+        _send_to(ADMIN_CHAT_ID, f"🔄 *Group updated via /updategroup*\nTruck: *{name}*{name_line}\nNew group ID: `{chat_id}`")
     else:
         _send_to(chat_id, f"❌ Truck *{name}* not found.\nContact your dispatcher to register this truck.")
 
