@@ -302,7 +302,8 @@ def register_commands():
         {"command": "addtruck",    "description": "Add truck — /addtruck 4821 -100123456"},
         {"command": "setgroup",    "description": "Set group — /setgroup 4821 -100123456"},
         {"command": "listtruck",   "description": "List all trucks"},
-        {"command": "removetruck", "description": "Deactivate truck"},
+        {"command": "removetruck",   "description": "Deactivate truck"},
+        {"command": "updategroup",   "description": "Assign this group to a truck — /updategroup 0792"},
     ]
     _post("setMyCommands", {"commands": commands})
 
@@ -447,6 +448,9 @@ def poll_for_uploads():
                     _handle_findstop(text, chat_id)
                 except Exception as e:
                     _send_to(chat_id, f"❌ Error: `{e}`")
+                continue
+            elif text.startswith("/updategroup"):
+                _handle_updategroup(text, chat_id)
                 continue
 
             if chat_id != ADMIN_CHAT_ID:
@@ -1345,6 +1349,21 @@ def _handle_truckstats(text: str, chat_id: str) -> None:
         for t in reversed(best):
             lines.append(f"   • Truck *{t['vehicle_name']}* — {t['mpg']:.1f} MPG | {t['idle_hours_30d']:.0f}h idle")
         _send_to(chat_id, "\n".join(lines))
+
+
+def _handle_updategroup(text: str, chat_id: str) -> None:
+    """/updategroup <truck_name> — link this group to a truck. Bot reads group ID automatically."""
+    from database import upsert_truck_group
+    parts = text.strip().split()
+    if len(parts) < 2:
+        _send_to(chat_id, "Usage: `/updategroup 0792`\nBot will automatically assign this group to truck 0792.")
+        return
+    name = parts[1].strip()
+    if upsert_truck_group(name, chat_id):
+        _send_to(chat_id, f"✅ *Group assigned to Truck {name}*\nThis group will now receive fuel alerts for truck *{name}*.")
+        _send_to(ADMIN_CHAT_ID, f"🔄 *Group updated via /updategroup*\nTruck: *{name}*\nNew group ID: `{chat_id}`")
+    else:
+        _send_to(chat_id, f"❌ Truck *{name}* not found.\nContact your dispatcher to register this truck.")
 
 
 def _handle_flags(text: str, chat_id: str) -> None:
