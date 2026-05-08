@@ -74,10 +74,24 @@ SPARSE_STATES = {
 }
 
 
+def _detect_network(name: str) -> str:
+    """Classify a fuel stop's chain by name."""
+    n = (name or "").lower()
+    if 'pilot' in n or 'flying j' in n or 'flyingj' in n:
+        return 'pilot_flying_j'
+    if "love's" in n or 'loves' in n:
+        return 'loves'
+    if ' ta ' in n or n.startswith('ta ') or 'travel center' in n or 'petro ' in n:
+        return 'ta'
+    return 'other'
+
+
 def update_from_file(file_bytes: bytes, filename: str) -> tuple[int, str]:
     """
     Parse uploaded file and update fuel prices in DB.
-    Supports the daily EFS CSV format and cleaned CSV variants.
+
+    .csv  → old card system (EFS/WEX) — all truck stop networks, TRUNCATE + reload
+    .xls/.xlsx → new card system (Relay) — Pilot/Flying J only, upsert new_card_price
     """
     fname = filename.lower().strip()
 
@@ -89,9 +103,18 @@ def update_from_file(file_bytes: bytes, filename: str) -> tuple[int, str]:
             log.error(f"EFS CSV import error: {e}", exc_info=True)
             return 0, f"❌ Failed to import CSV: `{e}`"
 
+    if fname.endswith('.xls') or fname.endswith('.xlsx'):
+        try:
+            from database import import_relay_xls
+            return import_relay_xls(file_bytes)
+        except Exception as e:
+            log.error(f"Relay XLS import error: {e}", exc_info=True)
+            return 0, f"❌ Failed to import XLS: `{e}`"
+
     return 0, (
         f"❌ Unsupported file: `{filename}`\n"
-        f"Please send a fuel price CSV with station, city/state, coordinates, and card price columns."
+        f"Send a .csv file to update old card system prices (all stops).\n"
+        f"Send a .xls or .xlsx file to update new Relay card prices (Pilot/Flying J only)."
     )
 
 

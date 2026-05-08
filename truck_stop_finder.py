@@ -34,7 +34,7 @@ from config import (
     SAFETY_RESERVE,
     FUEL_ALERT_THRESHOLD_PCT,
 )
-from database import get_all_diesel_stops
+from database import get_all_diesel_stops, get_all_diesel_stops_for_system
 
 log = logging.getLogger(__name__)
 
@@ -170,12 +170,13 @@ def true_cost(stop: dict, truck_lat: float, truck_lng: float,
 
 # -- Main finder --------------------------------------------------------------
 
-def find_current_stop(truck_lat: float, truck_lng: float) -> dict | None:
+def find_current_stop(truck_lat: float, truck_lng: float,
+                      card_system: str = 'old') -> dict | None:
     """
     Check if truck is currently parked at a known fuel stop.
     Returns the CLOSEST stop within radius, or None.
     """
-    all_stops = get_all_diesel_stops()
+    all_stops = get_all_diesel_stops_for_system(card_system)
     best      = None
     best_dist = _AT_STOP_RADIUS + 1  # start outside radius
 
@@ -207,7 +208,8 @@ def find_cheaper_nearby(truck_lat: float, truck_lng: float,
                          current_stop: dict,
                          fuel_pct: float,
                          tank_gal: float = DEFAULT_TANK_GAL,
-                         mpg: float = DEFAULT_MPG) -> dict | None:
+                         mpg: float = DEFAULT_MPG,
+                         card_system: str = 'old') -> dict | None:
     """
     When truck is already parked at a fuel stop, check if there is a
     cheaper stop within _NEARBY_SEARCH_MILES. Returns the cheaper stop
@@ -217,7 +219,7 @@ def find_cheaper_nearby(truck_lat: float, truck_lng: float,
     if not current_price or current_price <= 0:
         return None
 
-    all_stops = get_all_diesel_stops()
+    all_stops = get_all_diesel_stops_for_system(card_system)
     candidates = []
 
     for stop in all_stops:
@@ -280,6 +282,7 @@ def find_emergency_stop(
     mpg: float,
     range_budget_miles: float,
     truck_state: str = "",
+    card_system: str = 'old',
 ) -> dict | None:
     """
     Find the cheapest reachable stop when the planned stop is unreachable.
@@ -294,7 +297,7 @@ def find_emergency_stop(
     tie-breaker so two equal-price stops resolve to the closer one.
     """
     max_search = min(range_budget_miles * 0.85, 150.0)
-    all_stops  = get_all_diesel_stops()
+    all_stops  = get_all_diesel_stops_for_system(card_system)
     candidates = []
 
     for stop in all_stops:
@@ -362,13 +365,14 @@ def find_critical_radial_stop(
     truck_lat: float,
     truck_lng: float,
     radius_miles: float = 50.0,
+    card_system: str = 'old',
 ) -> dict | None:
     """
     Critical fuel override (≤20% fuel): find the closest diesel stop within
     radius_miles using pure haversine distance — no directional filter,
     no CA exclusion, no price scoring. Nearest stop wins.
     """
-    all_stops  = get_all_diesel_stops()
+    all_stops  = get_all_diesel_stops_for_system(card_system)
     candidates = []
 
     for stop in all_stops:
@@ -411,6 +415,7 @@ def find_best_stops(
     mpg: float = DEFAULT_MPG,
     truck_state: str = "",
     max_radius: float | None = None,
+    card_system: str = 'old',
 ) -> tuple[dict | None, dict | None]:
     """
     Find the best 2 diesel stops for a truck.
@@ -419,7 +424,7 @@ def find_best_stops(
     Each stop dict has extra keys: distance_miles, detour_miles,
     fill_cost, true_cost, google_maps_url.
     """
-    all_stops = get_all_diesel_stops()
+    all_stops = get_all_diesel_stops_for_system(card_system)
     if not all_stops:
         log.warning("No diesel stops in database.")
         return None, None
@@ -605,6 +610,7 @@ def find_best_stops_on_route(
     mpg: float = DEFAULT_MPG,
     truck_heading: float = 0.0,
     max_radius: float | None = None,
+    card_system: str = 'old',
 ) -> tuple[dict | None, dict | None]:
     """
     Find best fuel stop along the actual route from QuickManage.
@@ -624,7 +630,7 @@ def find_best_stops_on_route(
         log.warning("Route has no destination coords — falling back to heading search")
         return None, None
 
-    all_stops = get_all_diesel_stops()
+    all_stops = get_all_diesel_stops_for_system(card_system)
     if not all_stops:
         return None, None
 
@@ -769,7 +775,15 @@ def find_best_stops_on_route(
     return best, alt
 
 def calc_savings(best: dict, alt: dict) -> float | None:
-    return None
+    """Return dollar savings of choosing best over alt, based on true_cost."""
+    if not best or not alt:
+        return None
+    best_tc = best.get("true_cost")
+    alt_tc  = alt.get("true_cost")
+    if best_tc is None or alt_tc is None:
+        return None
+    savings = alt_tc - best_tc
+    return round(savings, 2) if savings > 0 else None
 
 
 def is_near_stop(truck_lat, truck_lng, stop_lat, stop_lng,

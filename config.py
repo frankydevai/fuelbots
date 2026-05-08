@@ -137,6 +137,27 @@ CA_BORDER_FUEL_THRESHOLD = _float("CA_BORDER_FUEL_THRESHOLD", 70.0)
 IFTA_HOME_STATE = os.environ.get("IFTA_HOME_STATE", "").upper().strip() or None
 
 
+# ── Active truck classifier ───────────────────────────────────────────────────
+# Controls whether the classifier's output actually filters trucks from fuel alerts.
+#
+# shadow  (default) — classifier runs and writes status to DB; fuel logic is
+#                     unchanged. No trucks are skipped. Pure observation mode.
+# log               — same as shadow (no filtering), but logs a WARNING for each
+#                     truck that *would* have been excluded. Grep SHADOW_WOULD_FILTER
+#                     to audit edge cases before going to enforce.
+# enforce           — fuel logic skips trucks whose status is at_yard / in_shop /
+#                     unassigned. This is the production mode.
+_enforcement_raw = os.getenv("CLASSIFIER_ENFORCEMENT_MODE", "shadow").strip().lower()
+if _enforcement_raw not in ("shadow", "log", "enforce"):
+    print(
+        f"[config] WARNING: CLASSIFIER_ENFORCEMENT_MODE={_enforcement_raw!r} is not valid "
+        f"(must be shadow | log | enforce) — defaulting to 'shadow'",
+        flush=True,
+    )
+    _enforcement_raw = "shadow"
+CLASSIFIER_ENFORCEMENT_MODE = _enforcement_raw
+
+
 # ── Yards ─────────────────────────────────────────────────────────────────────
 
 YARDS = []

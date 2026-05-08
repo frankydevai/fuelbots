@@ -14,7 +14,7 @@ Sends to: dispatcher group + driver's Telegram group
 
 import math
 import logging
-from database import get_all_diesel_stops, db_cursor
+from database import get_all_diesel_stops, get_all_diesel_stops_for_system, db_cursor
 from truck_stop_finder import haversine_miles, bearing, angle_diff, reachable_miles
 from ifta import net_price_after_ifta, get_ifta_rate, HOME_STATE_RATE as _IFTA_HOME_RATE
 from border_strategy import (
@@ -244,6 +244,7 @@ def plan_route_briefing(
     tank_gal: float,
     mpg: float,
     route: dict,
+    card_system: str = 'old',
 ) -> dict:
     """
     Plan ALL fuel stops needed for entire route from current position.
@@ -251,7 +252,8 @@ def plan_route_briefing(
     Returns a full route plan with the first recommended stop, all planned stops,
     and any border-fuel strategy decisions.
     """
-    all_stops = get_all_diesel_stops()
+    from database import get_all_diesel_stops_for_system
+    all_stops = get_all_diesel_stops_for_system(card_system)
     stops_raw = route.get("stops", [])
     dest      = route.get("destination", {})
     dest_lat  = float(dest["lat"]) if dest.get("lat") else None
@@ -307,7 +309,8 @@ def plan_route_briefing(
         from price_updater import calculate_arrival_fuel_target
         arrival_info = calculate_arrival_fuel_target(dest_state, tank_gal, mpg)
         arrival_target_pct = arrival_info["target_pct"]
-    except Exception:
+    except Exception as _e:
+        log.warning(f"calculate_arrival_fuel_target failed, using default: {_e}")
         arrival_target_pct = SAFETY_RESERVE * 100
 
     # Must arrive with at least arrival_target_pct fuel

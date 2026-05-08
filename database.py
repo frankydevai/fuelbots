@@ -12,9 +12,11 @@ Tables:
 
 import json
 import logging
+import threading
 import time
 import psycopg2
 import psycopg2.extras
+import psycopg2.pool
 from contextlib import contextmanager
 from datetime import datetime
 from config import DATABASE_URL
@@ -22,43 +24,81 @@ from config import DATABASE_URL
 log = logging.getLogger(__name__)
 
 
-# -- Connection ---------------------------------------------------------------
+# -- Connection pool ----------------------------------------------------------
+# One shared pool for the entire process. ThreadedConnectionPool is safe to
+# call from multiple threads simultaneously (background MPG sync, Telegram
+# thread, and main truck-processing thread all share it).
 
-def get_connection(retries: int = 3, delay: float = 2.0):
-    """Connect to PostgreSQL with automatic retry on connection failure."""
+_pool: psycopg2.pool.ThreadedConnectionPool | None = None
+_pool_lock = threading.Lock()
+
+_POOL_MIN  = 2
+_POOL_MAX  = 15   # raised to handle 50-truck fleet + background threads
+_CONN_ARGS = dict(
+    connect_timeout=10,
+    keepalives=1,
+    keepalives_idle=30,
+    keepalives_interval=10,
+    keepalives_count=3,
+)
+
+
+def _get_pool() -> psycopg2.pool.ThreadedConnectionPool:
+    """Return (and lazily initialise) the shared connection pool."""
+    global _pool
+    if _pool is None:
+        with _pool_lock:
+            if _pool is None:   # double-checked locking
+                _pool = psycopg2.pool.ThreadedConnectionPool(
+                    _POOL_MIN, _POOL_MAX, DATABASE_URL, **_CONN_ARGS
+                )
+                log.info(f"DB pool ready (min={_POOL_MIN} max={_POOL_MAX})")
+    return _pool
+
+
+def _connect_direct():
+    """Open a single throw-away connection — used only by init_db()."""
     last_err = None
-    for attempt in range(1, retries + 1):
+    for attempt in range(1, 4):
         try:
-            conn = psycopg2.connect(
-                DATABASE_URL,
-                connect_timeout=10,
-                keepalives=1,
-                keepalives_idle=30,
-                keepalives_interval=10,
-                keepalives_count=3,
-            )
-            return conn
+            return psycopg2.connect(DATABASE_URL, **_CONN_ARGS)
         except psycopg2.OperationalError as e:
             last_err = e
-            log.warning(f"DB connection attempt {attempt}/{retries} failed: {e}")
-            if attempt < retries:
-                time.sleep(delay * attempt)
+            log.warning(f"DB connect attempt {attempt}/3 failed: {e}")
+            if attempt < 3:
+                time.sleep(2 * attempt)
     raise last_err
+
+
+# Keep the old name so any external callers don't break.
+def get_connection(retries: int = 3, delay: float = 2.0):
+    return _connect_direct()
 
 
 @contextmanager
 def db_cursor():
-    """Yields a dict cursor; commits on success, rolls back on error."""
-    conn = get_connection()
+    """Yield a RealDictCursor from the pool; commit on success, rollback on error."""
+    pool = _get_pool()
+    conn = None
     try:
+        conn = pool.getconn()
+        conn.autocommit = False
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         yield cur
         conn.commit()
     except Exception:
-        conn.rollback()
+        if conn:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
         raise
     finally:
-        conn.close()
+        if conn:
+            try:
+                pool.putconn(conn)
+            except Exception as _pe:
+                log.warning(f"pool.putconn failed: {_pe}")
 
 
 # -- Schema -------------------------------------------------------------------
@@ -74,6 +114,7 @@ CREATE TABLE IF NOT EXISTS trucks (
     tank_size_known     BOOLEAN NOT NULL DEFAULT FALSE,
     mpg_known           BOOLEAN NOT NULL DEFAULT FALSE,
     is_active           BOOLEAN NOT NULL DEFAULT TRUE,
+    fuel_card_system    VARCHAR(20) NOT NULL DEFAULT 'old',
     notes               TEXT,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -102,12 +143,34 @@ CREATE TABLE IF NOT EXISTS fuel_stops (
     latitude         FLOAT   NOT NULL,
     retail_price     REAL,
     discounted_price REAL,
+    network          VARCHAR(50) DEFAULT 'other',
+    new_card_price   REAL,
     price_updated    TIMESTAMPTZ DEFAULT NOW(),
     UNIQUE (station_name, city, state)
 );
 
 CREATE INDEX IF NOT EXISTS idx_fuel_stops_location ON fuel_stops (latitude, longitude);
 CREATE INDEX IF NOT EXISTS idx_fuel_stops_state    ON fuel_stops (state);
+
+-- pilot_contracted_prices: Relay card prices — Pilot/Flying J only, loaded from XLS
+-- Identical column layout to fuel_stops so query code just switches the table name.
+CREATE TABLE IF NOT EXISTS pilot_contracted_prices (
+    id               SERIAL PRIMARY KEY,
+    station_name     TEXT    NOT NULL,
+    address          TEXT,
+    city             TEXT,
+    state            TEXT    NOT NULL,
+    longitude        FLOAT   NOT NULL,
+    latitude         FLOAT   NOT NULL,
+    retail_price     REAL,
+    discounted_price REAL,
+    network          VARCHAR(50) DEFAULT 'pilot_flying_j',
+    price_updated    TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE (station_name, city, state)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pilot_prices_location ON pilot_contracted_prices (latitude, longitude);
+CREATE INDEX IF NOT EXISTS idx_pilot_prices_state    ON pilot_contracted_prices (state);
 
 -- truck_states: full state persisted to survive Railway redeploys
 CREATE TABLE IF NOT EXISTS truck_states (
@@ -264,13 +327,52 @@ CREATE TABLE IF NOT EXISTS stop_visits (
     visited_at      TIMESTAMPTZ,
     created_at      TIMESTAMPTZ DEFAULT NOW()
 );
+
+-- geofences: yard and shop locations used by the active truck classifier
+CREATE TABLE IF NOT EXISTS geofences (
+    id             SERIAL PRIMARY KEY,
+    name           VARCHAR(100),
+    type           VARCHAR(20),        -- 'yard' or 'shop'
+    latitude       DECIMAL(10,7)  NOT NULL,
+    longitude      DECIMAL(10,7)  NOT NULL,
+    radius_meters  INTEGER        NOT NULL DEFAULT 200,
+    company_id     INTEGER,
+    created_at     TIMESTAMPTZ    NOT NULL DEFAULT NOW()
+);
+
+-- driver_group_events: audit log for all Telegram group membership changes
+-- event_type: 'joined','left','kicked','verified','deactivated','reassigned'
+-- detected_by: 'realtime','heartbeat','admin'
+CREATE TABLE IF NOT EXISTS driver_group_events (
+    id            SERIAL PRIMARY KEY,
+    truck_number  TEXT NOT NULL,
+    event_type    TEXT NOT NULL,
+    group_id      TEXT,
+    driver_name   TEXT,
+    detected_by   TEXT DEFAULT 'realtime',
+    created_at    TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_dge_truck ON driver_group_events(truck_number);
+CREATE INDEX IF NOT EXISTS idx_dge_time  ON driver_group_events(created_at);
+
+-- drivers: one row per assignment (is_active=FALSE when reassigned or removed)
+CREATE TABLE IF NOT EXISTS drivers (
+    id             SERIAL PRIMARY KEY,
+    truck_number   TEXT NOT NULL,
+    driver_name    TEXT NOT NULL,
+    telegram_group TEXT,
+    assigned_at    TIMESTAMPTZ DEFAULT NOW(),
+    assigned_by    TEXT,
+    is_active      BOOLEAN DEFAULT TRUE
+);
+CREATE INDEX IF NOT EXISTS idx_drivers_truck ON drivers(truck_number);
 """
 
 
 def init_db():
     """Create all tables if they don't exist. Runs migrations for existing DBs."""
     log.info("Initializing PostgreSQL schema...")
-    conn = get_connection()
+    conn = _connect_direct()    # direct conn — pool not warmed yet at startup
     cur = conn.cursor()
     cur.execute(SCHEMA_SQL)
     # Migrations for existing DBs
@@ -286,8 +388,8 @@ def init_db():
         col_name = col_def.split()[0]
         try:
             cur.execute(f"ALTER TABLE fuel_alerts ADD COLUMN IF NOT EXISTS {col_def}")
-        except Exception:
-            pass
+        except Exception as _e:
+            log.warning(f"init_db: could not add column {col_def!r}: {_e}")
     for col, coltype in [
         ("prev_truck_group",       "TEXT"),
         ("prev_truck_msg_id",      "BIGINT"),
@@ -317,6 +419,25 @@ def init_db():
     ]:
         cur.execute(f"ALTER TABLE stop_visits ADD COLUMN IF NOT EXISTS {col} {coltype}")
     cur.execute("ALTER TABLE trucks ADD COLUMN IF NOT EXISTS telegram_group_name TEXT")
+    # Active truck classifier columns
+    for col, coltype in [
+        ("activity_status",   "VARCHAR(20)"),
+        ("status_updated_at", "TIMESTAMPTZ"),
+        ("status_signals",    "JSONB"),
+    ]:
+        cur.execute(f"ALTER TABLE trucks ADD COLUMN IF NOT EXISTS {col} {coltype}")
+    # Dual fuel card system
+    cur.execute("ALTER TABLE trucks ADD COLUMN IF NOT EXISTS fuel_card_system VARCHAR(20) NOT NULL DEFAULT 'old'")
+    cur.execute("ALTER TABLE fuel_stops ADD COLUMN IF NOT EXISTS network VARCHAR(50) DEFAULT 'other'")
+    cur.execute("ALTER TABLE fuel_stops ADD COLUMN IF NOT EXISTS new_card_price REAL")
+    # Driver group change detection
+    for col, coltype in [
+        ("group_verified",   "BOOLEAN DEFAULT FALSE"),
+        ("last_verified_at", "TIMESTAMPTZ"),
+        ("alert_paused",     "BOOLEAN DEFAULT FALSE"),
+        ("pause_reason",     "TEXT"),
+    ]:
+        cur.execute(f"ALTER TABLE trucks ADD COLUMN IF NOT EXISTS {col} {coltype}")
     conn.commit()
     conn.close()
     log.info("✅ Database schema ready.")
@@ -387,12 +508,124 @@ def get_all_registered_trucks() -> list:
         return _rows(cur.fetchall())
 
 
-def auto_register_truck(vehicle_id: str, vehicle_name: str) -> bool:
-    """Auto-register a truck seen from Samsara if not already in DB. Returns True if newly registered."""
+# -- Active truck classifier --------------------------------------------------
+
+def get_truck_activity_status(vehicle_name: str) -> str | None:
     with db_cursor() as cur:
-        cur.execute("SELECT id FROM trucks WHERE vehicle_name = %s", (vehicle_name,))
-        if cur.fetchone():
-            return False
+        cur.execute(
+            "SELECT activity_status FROM trucks WHERE vehicle_name = %s",
+            (vehicle_name,)
+        )
+        row = cur.fetchone()
+        return row["activity_status"] if row else None
+
+
+def save_truck_activity_status(vehicle_name: str, status: str, signals: dict) -> None:
+    import json as _json
+    with db_cursor() as cur:
+        cur.execute(
+            """
+            UPDATE trucks
+               SET activity_status   = %s,
+                   status_updated_at = NOW(),
+                   status_signals    = %s
+             WHERE vehicle_name = %s
+            """,
+            (status, _json.dumps(signals), vehicle_name),
+        )
+
+
+def get_all_truck_activity_statuses() -> dict[str, str]:
+    """Return {vehicle_name: activity_status} for all active trucks."""
+    with db_cursor() as cur:
+        cur.execute(
+            "SELECT vehicle_name, activity_status FROM trucks WHERE is_active = TRUE"
+        )
+        return {
+            row["vehicle_name"]: row["activity_status"]
+            for row in cur.fetchall()
+            if row["activity_status"] is not None
+        }
+
+
+# -- Geofences ----------------------------------------------------------------
+
+def get_all_geofences() -> list[dict]:
+    with db_cursor() as cur:
+        cur.execute(
+            "SELECT id, name, type, latitude, longitude, radius_meters FROM geofences ORDER BY type, name"
+        )
+        return _rows(cur.fetchall())
+
+
+def add_geofence(name: str, fence_type: str, lat: float, lng: float,
+                 radius_m: int = 200, company_id: int = None) -> int:
+    with db_cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO geofences (name, type, latitude, longitude, radius_meters, company_id)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            RETURNING id
+            """,
+            (name, fence_type, lat, lng, radius_m, company_id),
+        )
+        return cur.fetchone()["id"]
+
+
+# -- trucks (continued) -------------------------------------------------------
+
+def _truck_number(name: str) -> str:
+    """Extract the numeric truck ID from any name format.
+    '4966 - AQUISHA HARRIS' → '4966'
+    'UNIT 1627'             → '1627'
+    'Unit - 1637'           → '1637'
+    'Unit 3821'             → '3821'
+    '777'                   → '777'
+    Returns the first run of 3+ digits found, or the raw name if none.
+    """
+    import re
+    m = re.search(r'\b(\d{3,})\b', name or '')
+    return m.group(1) if m else (name or '').strip()
+
+
+def auto_register_truck(vehicle_id: str, vehicle_name: str) -> bool:
+    """Register a truck from Samsara, keyed by numeric truck number.
+
+    - If a truck with the same number prefix already exists: update its name to
+      the current Samsara name (driver reassignment) and re-activate if inactive.
+    - If no match: insert a new row.
+    Returns True if anything changed (insert, rename, or re-activation).
+    """
+    number = _truck_number(vehicle_name)
+    with db_cursor() as cur:
+        # Find any existing row whose name starts with this truck number
+        cur.execute(
+            """SELECT vehicle_name, is_active FROM trucks
+               WHERE vehicle_name = %s
+                  OR vehicle_name ~* %s
+               ORDER BY is_active DESC, LENGTH(vehicle_name) DESC
+               LIMIT 1""",
+            (vehicle_name, r'(^|[^0-9])' + number + r'([^0-9]|$)'),
+        )
+        row = cur.fetchone()
+
+        if row:
+            existing_name   = row["vehicle_name"]
+            existing_active = row["is_active"]
+            name_changed    = existing_name != vehicle_name
+            if name_changed or not existing_active:
+                cur.execute(
+                    "UPDATE trucks SET vehicle_name = %s, is_active = TRUE WHERE vehicle_name = %s",
+                    (vehicle_name, existing_name),
+                )
+                if name_changed:
+                    log.info(f"Truck renamed: '{existing_name}' → '{vehicle_name}'")
+                else:
+                    log.info(f"Re-activated truck: {vehicle_name}")
+                return True
+            return False  # already active with correct name
+
+        # Genuinely new truck
         cur.execute(
             "INSERT INTO trucks (vehicle_name, is_active) VALUES (%s, TRUE)",
             (vehicle_name,)
@@ -535,6 +768,7 @@ def import_efs_csv(file_bytes: bytes) -> tuple[int, str]:
             if not name or not state or lat is None or lng is None or discount is None:
                 skipped += 1
                 continue
+            from price_updater import _detect_network
             records.append({
                 "station_name":     name,
                 "address":          _pick(r, ("Address", "address", "street_address")),
@@ -544,6 +778,7 @@ def import_efs_csv(file_bytes: bytes) -> tuple[int, str]:
                 "latitude":         lat,
                 "retail_price":     retail,
                 "discounted_price": discount,
+                "network":          _detect_network(name),
             })
         except Exception:
             skipped += 1
@@ -610,11 +845,11 @@ def import_efs_csv(file_bytes: bytes) -> tuple[int, str]:
         cur.executemany("""
             INSERT INTO fuel_stops
                 (station_name, address, city, state, longitude, latitude,
-                 retail_price, discounted_price, price_updated)
+                 retail_price, discounted_price, network, price_updated)
             VALUES
                 (%(station_name)s, %(address)s, %(city)s, %(state)s,
                  %(longitude)s, %(latitude)s,
-                 %(retail_price)s, %(discounted_price)s, NOW())
+                 %(retail_price)s, %(discounted_price)s, %(network)s, NOW())
         """, records)
 
     msg = (
@@ -629,7 +864,7 @@ def import_efs_csv(file_bytes: bytes) -> tuple[int, str]:
 
 
 def get_all_diesel_stops() -> list:
-    """Return all stops that have a discounted price (card price)."""
+    """Return all stops for old card system (CSV-loaded, any network)."""
     with db_cursor() as cur:
         cur.execute("""
             SELECT
@@ -642,6 +877,7 @@ def get_all_diesel_stops() -> list:
                 latitude,
                 retail_price,
                 discounted_price AS diesel_price,
+                network,
                 price_updated
             FROM fuel_stops
             WHERE discounted_price IS NOT NULL
@@ -650,10 +886,409 @@ def get_all_diesel_stops() -> list:
         return _rows(cur.fetchall())
 
 
-def get_stops_count() -> int:
+def get_all_diesel_stops_for_system(card_system: str = 'old') -> list:
+    """Return stops from the correct price table for this card system.
+
+    old → fuel_stops            (EFS/WEX card, all networks, CSV-loaded)
+    new → pilot_contracted_prices (Relay card, Pilot/FJ only, XLS-loaded)
+
+    Both tables have identical column layouts — only the table name changes.
+    """
+    _VALID = {'old': 'fuel_stops', 'new': 'pilot_contracted_prices'}
+    table  = _VALID.get(card_system, 'fuel_stops')
+    with db_cursor() as cur:
+        cur.execute(f"""
+            SELECT
+                id,
+                station_name  AS store_name,
+                address,
+                city,
+                state,
+                longitude,
+                latitude,
+                retail_price,
+                discounted_price AS diesel_price,
+                network,
+                price_updated
+            FROM {table}
+            WHERE discounted_price IS NOT NULL
+            ORDER BY state, city
+        """)
+        return _rows(cur.fetchall())
+
+
+def _read_excel_rows(file_bytes: bytes) -> tuple[list[str], list[list], str | None]:
+    """Detect .xls vs .xlsx by file magic bytes and return (headers, data_rows, error).
+
+    .xlsx files start with PK\x03\x04 (ZIP container) → openpyxl
+    .xls  files start with \xD0\xCF\x11\xE0 (OLE2 compound) → xlrd
+    """
+    import io
+
+    if not file_bytes or len(file_bytes) < 8:
+        return [], [], "file is empty or too small"
+
+    head = file_bytes[:8]
+
+    # -- .xlsx (ZIP) -----------------------------------------------------------
+    if head.startswith(b"PK\x03\x04"):
+        try:
+            import openpyxl
+        except ImportError:
+            return [], [], "openpyxl not installed (pip install openpyxl)"
+        try:
+            wb = openpyxl.load_workbook(
+                io.BytesIO(file_bytes), read_only=True, data_only=True
+            )
+            ws = wb.active
+            rows_iter = iter(ws.iter_rows(values_only=True))
+            header_row = next(rows_iter, None)
+            if not header_row:
+                return [], [], "xlsx file has no header row"
+            headers = [str(h or "").strip().lower() for h in header_row]
+            data_rows = [list(r) for r in rows_iter]
+            return headers, data_rows, None
+        except Exception as e:
+            return [], [], f"xlsx parse error: {e}"
+
+    # -- .xls (OLE2) -----------------------------------------------------------
+    if head.startswith(b"\xD0\xCF\x11\xE0"):
+        try:
+            import xlrd
+        except ImportError:
+            return [], [], (
+                "xlrd not installed (pip install xlrd==2.0.1) — "
+                "needed to read legacy .xls files"
+            )
+        try:
+            book = xlrd.open_workbook(file_contents=file_bytes)
+            sheet = book.sheet_by_index(0)
+            if sheet.nrows < 1:
+                return [], [], "xls sheet is empty"
+            headers = [
+                str(sheet.cell_value(0, c) or "").strip().lower()
+                for c in range(sheet.ncols)
+            ]
+            data_rows = []
+            for r in range(1, sheet.nrows):
+                row = [sheet.cell_value(r, c) for c in range(sheet.ncols)]
+                data_rows.append(row)
+            return headers, data_rows, None
+        except Exception as e:
+            return [], [], f"xls parse error: {e}"
+
+    # -- Some Relay exports are actually HTML tables saved with .xls extension
+    if head.lstrip().lower().startswith((b"<html", b"<!doc", b"<?xml", b"<table")):
+        try:
+            from html.parser import HTMLParser
+
+            class _T(HTMLParser):
+                def __init__(self):
+                    super().__init__()
+                    self.rows = []
+                    self.row = []
+                    self.cell = []
+                    self.in_cell = False
+                def handle_starttag(self, tag, attrs):
+                    if tag in ("td", "th"):
+                        self.in_cell = True
+                        self.cell = []
+                    elif tag == "tr":
+                        self.row = []
+                def handle_endtag(self, tag):
+                    if tag in ("td", "th"):
+                        self.row.append("".join(self.cell).strip())
+                        self.in_cell = False
+                    elif tag == "tr":
+                        if self.row:
+                            self.rows.append(self.row)
+                def handle_data(self, data):
+                    if self.in_cell:
+                        self.cell.append(data)
+
+            text = file_bytes.decode("utf-8", errors="ignore")
+            p = _T()
+            p.feed(text)
+            if not p.rows:
+                return [], [], "html-style xls had no <table> rows"
+            headers = [str(h or "").strip().lower() for h in p.rows[0]]
+            return headers, [list(r) for r in p.rows[1:]], None
+        except Exception as e:
+            return [], [], f"html-style xls parse error: {e}"
+
+    return [], [], (
+        f"unrecognized file format (first 8 bytes: {head!r}). "
+        f"Expected .xls (OLE2), .xlsx (ZIP), or HTML table."
+    )
+
+
+def import_relay_xls(file_bytes: bytes) -> tuple[int, str]:
+    """
+    Import Relay card price file into pilot_contracted_prices (new system).
+    Only Pilot/Flying J rows are accepted. Upserts by (station_name, city, state).
+    Supports .xls (legacy OLE2), .xlsx (ZIP), and HTML-table-as-xls.
+
+    TWO MODES:
+      Full upload  (lat/lng columns present) — stores coordinates permanently.
+      Price-only update (no lat/lng columns) — updates card price only using
+        stored coordinates from a previous full upload. City is optional:
+        matches by (station_name, city, state) first, then (station_name, state).
+
+    Price column: looks for "card price" first, then "card", "discount", "discounted".
+    """
+    from price_updater import _detect_network
+
+    def _to_float(val):
+        if val is None:
+            return None
+        text = str(val).strip().replace("$", "").replace(",", "")
+        try:
+            return float(text)
+        except Exception:
+            return None
+
+    headers, data_rows, err = _read_excel_rows(file_bytes)
+    if err:
+        return 0, f"❌ Could not read XLS file: {err}"
+    if not headers:
+        return 0, "❌ XLS file has no header row."
+
+    def _col(names):
+        # Exact match first (full column name), then substring fallback
+        for n in names:
+            for i, h in enumerate(headers):
+                if h.strip().lower() == n.lower():
+                    return i
+        for n in names:
+            for i, h in enumerate(headers):
+                if n.lower() in h:
+                    return i
+        return None
+
+    idx_name   = _col(["station", "store", "name"])
+    idx_addr   = _col(["address", "street"])
+    idx_city   = _col(["city"])
+    idx_state  = _col(["state"])
+    idx_lat    = _col(["lat"])
+    idx_lng    = _col(["lon", "lng", "long"])
+    idx_retail = _col(["retail"])
+    # "card price" first, then fallbacks — per user requirement
+    idx_card   = _col(["card price", "card", "discount", "discounted"])
+
+    if any(i is None for i in [idx_name, idx_state, idx_card]):
+        col_list = ", ".join(f"`{h}`" for h in headers[:20])
+        return 0, (
+            "❌ XLS missing required columns: station name, state, card price.\n"
+            f"Columns found: {col_list}"
+        )
+
+    has_coords = idx_lat is not None and idx_lng is not None
+
+    loaded    = 0
+    skipped   = 0
+    no_match  = 0   # price-only mode: row found no stored coords to update
+
+    with db_cursor() as cur:
+        for row in data_rows:
+            try:
+                def _cell(i):
+                    return row[i] if i is not None and 0 <= i < len(row) else None
+
+                name  = str(_cell(idx_name) or "").strip()
+                state = str(_cell(idx_state) or "").strip().upper()
+                price = _to_float(_cell(idx_card))
+
+                if not name or not state or price is None:
+                    skipped += 1
+                    continue
+                if _detect_network(name) != 'pilot_flying_j':
+                    skipped += 1
+                    continue
+
+                city    = str(_cell(idx_city) or "").strip()
+                address = str(_cell(idx_addr) or "").strip()
+                retail  = _to_float(_cell(idx_retail))
+
+                if has_coords:
+                    # ── Full upload: store coordinates permanently ──────────
+                    lat = _to_float(_cell(idx_lat))
+                    lng = _to_float(_cell(idx_lng))
+                    if lat is None or lng is None:
+                        skipped += 1
+                        continue
+                    cur.execute("""
+                        INSERT INTO pilot_contracted_prices
+                            (station_name, address, city, state, longitude, latitude,
+                             retail_price, discounted_price, network, price_updated)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'pilot_flying_j', NOW())
+                        ON CONFLICT (station_name, city, state) DO UPDATE SET
+                            address          = COALESCE(EXCLUDED.address,
+                                                        pilot_contracted_prices.address),
+                            longitude        = EXCLUDED.longitude,
+                            latitude         = EXCLUDED.latitude,
+                            discounted_price = EXCLUDED.discounted_price,
+                            retail_price     = COALESCE(EXCLUDED.retail_price,
+                                                        pilot_contracted_prices.retail_price),
+                            price_updated    = NOW()
+                    """, (name, address, city, state, lng, lat, retail, price))
+                    loaded += 1
+                else:
+                    # ── Price-only update: use stored lat/lng ───────────────
+                    # Try exact (name, city, state) first
+                    rows_updated = 0
+                    if city:
+                        cur.execute("""
+                            UPDATE pilot_contracted_prices
+                               SET discounted_price = %s,
+                                   retail_price     = COALESCE(%s, retail_price),
+                                   price_updated    = NOW()
+                             WHERE station_name = %s AND city = %s AND state = %s
+                        """, (price, retail, name, city, state))
+                        rows_updated = cur.rowcount
+
+                    # Fallback: match by (name, state) if city didn't match or is blank
+                    if rows_updated == 0:
+                        cur.execute("""
+                            UPDATE pilot_contracted_prices
+                               SET discounted_price = %s,
+                                   retail_price     = COALESCE(%s, retail_price),
+                                   price_updated    = NOW()
+                             WHERE station_name = %s AND state = %s
+                        """, (price, retail, name, state))
+                        rows_updated = cur.rowcount
+
+                    if rows_updated > 0:
+                        loaded += rows_updated
+                    else:
+                        no_match += 1
+
+            except Exception:
+                skipped += 1
+
+    if has_coords:
+        msg = (
+            "✅ *Relay prices updated — full upload*\n"
+            f"{loaded} Pilot/Flying J stops loaded with coordinates\n"
+            f"{skipped} rows skipped (not Pilot/FJ or missing data)\n"
+            "📌 Coordinates stored permanently — future uploads can be price-only\n"
+            "Old EFS/WEX prices in fuel\\_stops — unchanged"
+        )
+    else:
+        msg = (
+            "✅ *Relay prices updated — price-only update*\n"
+            f"{loaded} stops updated (card price refreshed)\n"
+            f"{no_match} rows skipped (station not found in DB — upload full file first)\n"
+            f"{skipped} rows skipped (not Pilot/FJ or missing data)\n"
+            "Old EFS/WEX prices in fuel\\_stops — unchanged"
+        )
+    return loaded, msg
+
+
+# -- Fuel card system management ---------------------------------------------
+
+def get_truck_card_system(vehicle_name: str) -> str:
+    """Return 'old' or 'new' for a truck's fuel card system."""
+    with db_cursor() as cur:
+        cur.execute(
+            "SELECT fuel_card_system FROM trucks WHERE vehicle_name = %s AND is_active = TRUE",
+            (vehicle_name,)
+        )
+        row = cur.fetchone()
+        return (row["fuel_card_system"] or 'old') if row else 'old'
+
+
+def get_all_truck_card_systems() -> dict:
+    """Return {vehicle_name: 'old'|'new'} for all active trucks in one query."""
+    with db_cursor() as cur:
+        cur.execute("SELECT vehicle_name, fuel_card_system FROM trucks WHERE is_active = TRUE")
+        rows = cur.fetchall()
+    return {r["vehicle_name"]: (r["fuel_card_system"] or 'old') for r in rows}
+
+
+def set_truck_card_system(vehicle_name: str, system: str) -> list:
+    """Set a truck's fuel card system ('old' or 'new').
+    Matches by exact name OR by numeric truck ID anywhere in the name.
+    e.g. '1637' matches 'Unit - 1637', '1079' matches '1079 - JEAN VOLMAR'.
+    Returns list of actual vehicle_names updated (empty list = not found).
+    """
+    number = _truck_number(vehicle_name)
+    with db_cursor() as cur:
+        # Use word-boundary regex so '777' doesn't match '7770'
+        cur.execute(
+            """SELECT vehicle_name FROM trucks
+               WHERE is_active = TRUE
+                 AND (vehicle_name = %s
+                      OR vehicle_name ~* %s)""",
+            (vehicle_name, r'(^|[^0-9])' + number + r'([^0-9]|$)'),
+        )
+        matched = [r["vehicle_name"] for r in cur.fetchall()]
+        if matched:
+            cur.execute(
+                "UPDATE trucks SET fuel_card_system = %s WHERE vehicle_name = ANY(%s) AND is_active = TRUE",
+                (system, matched)
+            )
+    return matched
+
+
+def cleanup_duplicate_trucks() -> list:
+    """Remove duplicate truck rows that share the same numeric prefix.
+    e.g. '8238', '8238 -', '8238 - JOHN DOE' are the same truck.
+    Keeps the longest (most complete) name, deactivates the shorter duplicates.
+    Returns list of (kept_name, removed_name) pairs.
+    """
+    removed = []
+    with db_cursor() as cur:
+        cur.execute("SELECT vehicle_name FROM trucks WHERE is_active = TRUE ORDER BY vehicle_name")
+        all_names = [r["vehicle_name"] for r in cur.fetchall()]
+
+    # Group names by their numeric truck ID (works for all name formats)
+    from collections import defaultdict
+    groups = defaultdict(list)
+    for name in all_names:
+        groups[_truck_number(name)].append(name)
+
+    with db_cursor() as cur:
+        for prefix, names in groups.items():
+            if len(names) < 2:
+                continue
+            # Keep the longest name (most complete with driver info)
+            names_sorted = sorted(names, key=len, reverse=True)
+            keep  = names_sorted[0]
+            dupes = names_sorted[1:]
+            for dupe in dupes:
+                cur.execute(
+                    "UPDATE trucks SET is_active = FALSE WHERE vehicle_name = %s",
+                    (dupe,)
+                )
+                removed.append((keep, dupe))
+
+    return removed
+
+
+def set_group_card_system(group_chat_id: str, system: str) -> list:
+    """Move all trucks in a group to a fuel card system. Returns list of truck names updated."""
+    with db_cursor() as cur:
+        cur.execute(
+            "SELECT vehicle_name FROM trucks WHERE telegram_group_id = %s AND is_active = TRUE",
+            (str(group_chat_id),)
+        )
+        names = [row["vehicle_name"] for row in cur.fetchall()]
+        if names:
+            cur.execute(
+                "UPDATE trucks SET fuel_card_system = %s WHERE telegram_group_id = %s AND is_active = TRUE",
+                (system, str(group_chat_id))
+            )
+    return names
+
+
+def get_stops_count() -> dict:
+    """Return stop counts for both price tables."""
     with db_cursor() as cur:
         cur.execute("SELECT COUNT(*) as cnt FROM fuel_stops WHERE discounted_price IS NOT NULL")
-        return cur.fetchone()["cnt"]
+        old_cnt = cur.fetchone()["cnt"]
+        cur.execute("SELECT COUNT(*) as cnt FROM pilot_contracted_prices WHERE discounted_price IS NOT NULL")
+        new_cnt = cur.fetchone()["cnt"]
+    return {"old": old_cnt, "new": new_cnt}
 
 
 def get_price_last_updated():
@@ -661,6 +1296,47 @@ def get_price_last_updated():
         cur.execute("SELECT MAX(price_updated) as latest FROM fuel_stops")
         row = cur.fetchone()
         return row["latest"] if row else None
+
+
+def get_alert_count_by_system() -> dict:
+    """Return how many trucks are actively receiving fuel alerts, per card system.
+
+    Returns:
+        {
+          'old': {'total': N, 'with_group': N, 'active': N, 'paused': N},
+          'new': {'total': N, 'with_group': N, 'active': N, 'paused': N},
+        }
+    where 'active' = has Telegram group AND alerts not paused.
+    """
+    with db_cursor() as cur:
+        cur.execute("""
+            SELECT
+                fuel_card_system,
+                COUNT(*)                                                               AS total,
+                COUNT(telegram_group_id)                                               AS with_group,
+                COUNT(*) FILTER (
+                    WHERE telegram_group_id IS NOT NULL
+                      AND (alert_paused = FALSE OR alert_paused IS NULL)
+                )                                                                      AS active,
+                COUNT(*) FILTER (WHERE alert_paused = TRUE)                            AS paused
+            FROM trucks
+            WHERE is_active = TRUE
+            GROUP BY fuel_card_system
+            ORDER BY fuel_card_system
+        """)
+        result = {
+            'old': {'total': 0, 'with_group': 0, 'active': 0, 'paused': 0},
+            'new': {'total': 0, 'with_group': 0, 'active': 0, 'paused': 0},
+        }
+        for row in cur.fetchall():
+            system = row['fuel_card_system'] or 'old'
+            result[system] = {
+                'total':      int(row['total']),
+                'with_group': int(row['with_group']),
+                'active':     int(row['active']),
+                'paused':     int(row['paused']),
+            }
+    return result
 
 
 # -- truck_states -------------------------------------------------------------
@@ -1248,3 +1924,157 @@ def load_all_trip_states() -> dict:
         cur.execute("SELECT * FROM trip_state")
         rows = cur.fetchall()
     return {row["vehicle_name"]: _parse_trip_state_row(dict(row)) for row in rows}
+
+
+# -- Driver group change detection --------------------------------------------
+
+def log_driver_group_event(truck_number: str, event_type: str, group_id: str = None,
+                           driver_name: str = None, detected_by: str = 'realtime') -> None:
+    with db_cursor() as cur:
+        cur.execute("""
+            INSERT INTO driver_group_events (truck_number, event_type, group_id, driver_name, detected_by)
+            VALUES (%s, %s, %s, %s, %s)
+        """, (truck_number, event_type, group_id, driver_name, detected_by))
+
+
+def set_truck_alert_paused(vehicle_name: str, paused: bool, reason: str = None,
+                           group_verified: bool = None) -> None:
+    with db_cursor() as cur:
+        if group_verified is not None:
+            cur.execute("""
+                UPDATE trucks
+                   SET alert_paused = %s, pause_reason = %s, group_verified = %s
+                 WHERE vehicle_name = %s
+            """, (paused, reason, group_verified, vehicle_name))
+        else:
+            cur.execute("""
+                UPDATE trucks
+                   SET alert_paused = %s, pause_reason = %s
+                 WHERE vehicle_name = %s
+            """, (paused, reason, vehicle_name))
+
+
+def bulk_resume_bot_kicked() -> int:
+    """Un-pause all trucks paused with reason='bot_kicked' (heartbeat false-positives).
+    Returns the number of trucks resumed."""
+    with db_cursor() as cur:
+        cur.execute("""
+            UPDATE trucks
+               SET alert_paused = FALSE, pause_reason = NULL
+             WHERE alert_paused = TRUE
+               AND pause_reason = 'bot_kicked'
+               AND is_active = TRUE
+        """)
+        return cur.rowcount
+
+
+def set_truck_group_verified(vehicle_name: str, verified: bool) -> None:
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc) if verified else None
+    with db_cursor() as cur:
+        cur.execute("""
+            UPDATE trucks
+               SET group_verified = %s, last_verified_at = %s,
+                   alert_paused = FALSE, pause_reason = NULL
+             WHERE vehicle_name = %s
+        """, (verified, now, vehicle_name))
+
+
+def get_truck_alert_status(vehicle_name: str) -> dict | None:
+    with db_cursor() as cur:
+        cur.execute("""
+            SELECT alert_paused, pause_reason, group_verified, last_verified_at,
+                   telegram_group_id, vehicle_name
+              FROM trucks
+             WHERE vehicle_name = %s AND is_active = TRUE
+        """, (vehicle_name,))
+        return _row(cur.fetchone())
+
+
+def assign_driver(vehicle_name: str, driver_name: str, group_id: str,
+                  assigned_by: str = 'admin') -> None:
+    with db_cursor() as cur:
+        cur.execute("""
+            UPDATE drivers SET is_active = FALSE
+             WHERE truck_number = %s AND is_active = TRUE
+        """, (vehicle_name,))
+        cur.execute("""
+            INSERT INTO drivers (truck_number, driver_name, telegram_group, assigned_at, assigned_by, is_active)
+            VALUES (%s, %s, %s, NOW(), %s, TRUE)
+        """, (vehicle_name, driver_name, group_id, assigned_by))
+        cur.execute("""
+            UPDATE trucks
+               SET telegram_group_id = %s, alert_paused = FALSE, pause_reason = NULL,
+                   group_verified = FALSE
+             WHERE vehicle_name = %s
+        """, (group_id, vehicle_name))
+
+
+def remove_driver(vehicle_name: str) -> bool:
+    with db_cursor() as cur:
+        cur.execute("""
+            UPDATE drivers SET is_active = FALSE
+             WHERE truck_number = %s AND is_active = TRUE
+        """, (vehicle_name,))
+        rows = cur.rowcount
+        cur.execute("""
+            UPDATE trucks
+               SET alert_paused = TRUE, pause_reason = 'manually_removed'
+             WHERE vehicle_name = %s
+        """, (vehicle_name,))
+    return rows > 0
+
+
+def get_active_driver(vehicle_name: str) -> dict | None:
+    with db_cursor() as cur:
+        cur.execute("""
+            SELECT driver_name, telegram_group, assigned_at, assigned_by
+              FROM drivers
+             WHERE truck_number = %s AND is_active = TRUE
+             ORDER BY assigned_at DESC LIMIT 1
+        """, (vehicle_name,))
+        return _row(cur.fetchone())
+
+
+def get_driver_event_log(vehicle_name: str, limit: int = 10) -> list:
+    with db_cursor() as cur:
+        cur.execute("""
+            SELECT event_type, detected_by, group_id, driver_name, created_at
+              FROM driver_group_events
+             WHERE truck_number = %s
+             ORDER BY created_at DESC
+             LIMIT %s
+        """, (vehicle_name, limit))
+        return _rows(cur.fetchall())
+
+
+def get_all_driver_statuses() -> list:
+    with db_cursor() as cur:
+        cur.execute("""
+            SELECT t.vehicle_name, t.telegram_group_id, t.alert_paused, t.pause_reason,
+                   t.group_verified, d.driver_name
+              FROM trucks t
+              LEFT JOIN drivers d ON d.truck_number = t.vehicle_name AND d.is_active = TRUE
+             WHERE t.is_active = TRUE
+             ORDER BY t.vehicle_name
+        """)
+        return _rows(cur.fetchall())
+
+
+def resolve_truck_by_number(token: str) -> str | None:
+    """Return vehicle_name for a truck identified by partial number (e.g. '1637').
+    Matches the trucks table using word-boundary regex — same logic as set_truck_card_system.
+    Returns None if not found."""
+    import re
+    m = re.search(r'\b(\d{3,})\b', token or '')
+    number = m.group(1) if m else token.strip()
+    with db_cursor() as cur:
+        cur.execute("""
+            SELECT vehicle_name FROM trucks
+             WHERE is_active = TRUE
+               AND (vehicle_name = %s OR vehicle_name ~* %s)
+             ORDER BY LENGTH(vehicle_name) DESC
+             LIMIT 1
+        """, (token, r'(^|[^0-9])' + number + r'([^0-9]|$)'))
+        row = cur.fetchone()
+        return row["vehicle_name"] if row else None

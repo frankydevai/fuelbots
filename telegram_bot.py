@@ -7,6 +7,8 @@ import logging
 import requests
 from config import TELEGRAM_BOT_TOKEN, DISPATCHER_GROUP_ID, ADMIN_CHAT_ID, MIN_SAVINGS_DISPLAY
 
+import metrics
+
 log = logging.getLogger(__name__)
 
 force_check_now: bool = False
@@ -16,16 +18,20 @@ BASE_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 def _post(method: str, payload: dict, retries: int = 4) -> dict | None:
     for attempt in range(retries + 1):
         try:
-            resp = requests.post(f"{BASE_URL}/{method}", json=payload, timeout=10)
+            with metrics.Timer(f"telegram_{method}_seconds"):
+                resp = requests.post(f"{BASE_URL}/{method}", json=payload, timeout=10)
             if resp.status_code == 429:
                 wait = max(resp.json().get("parameters", {}).get("retry_after", 5), 5)
                 wait *= (attempt + 1)
+                metrics.incr("telegram_429_total")
                 log.warning(f"Telegram 429 — waiting {wait}s")
                 time.sleep(wait)
                 continue
             resp.raise_for_status()
+            metrics.incr(f"telegram_{method}_ok_total")
             return resp.json()
         except requests.RequestException as exc:
+            metrics.incr(f"telegram_{method}_err_total")
             log.error(f"Telegram {method} failed (attempt {attempt+1}): {exc}")
             if attempt < retries:
                 time.sleep(3 * (attempt + 1))
@@ -50,7 +56,18 @@ def _send_to(chat_id: str, text: str) -> int | None:
 
 
 def _send_to_truck(vehicle_name: str, text: str) -> dict:
-    from database import get_truck_group
+    from database import get_truck_group, get_truck_alert_status
+    # Layer 3 alert guard — do not send if alerts are paused for this truck
+    try:
+        status = get_truck_alert_status(vehicle_name)
+        if status and status.get("alert_paused"):
+            log.warning(
+                f"Alert skipped — {vehicle_name} paused: {status.get('pause_reason', 'unknown')}"
+            )
+            return {"truck_group": None, "truck_msg_id": None, "dispatcher_msg_id": None,
+                    "paused": True, "pause_reason": status.get("pause_reason")}
+    except Exception as _e:
+        log.warning(f"Alert guard check failed for {vehicle_name}: {_e}")
     truck_group = get_truck_group(vehicle_name)
     truck_msg_id = None
     dispatcher_msg_id = None
@@ -304,6 +321,7 @@ def register_commands():
         {"command": "listtruck",   "description": "List all trucks"},
         {"command": "removetruck",   "description": "Deactivate truck"},
         {"command": "updategroup",   "description": "Assign this group to a truck — /updategroup 0792"},
+        {"command": "alertcount",    "description": "How many drivers receiving alerts (by system)"},
     ]
     _post("setMyCommands", {"commands": commands})
 
@@ -345,7 +363,7 @@ def poll_for_uploads():
     try:
         result = _post("getUpdates", {
             "offset": _last_update_id + 1, "timeout": 0, "limit": 20,
-            "allowed_updates": ["message", "my_chat_member"],
+            "allowed_updates": ["message", "my_chat_member", "chat_member"],
         })
         if not result or not result.get("ok"):
             return
@@ -394,10 +412,26 @@ def poll_for_uploads():
                         _send_to(ADMIN_CHAT_ID, f"➕ *Bot added to group*\n*{g_title}*\nID: `{g_id}`\n`/setgroup TRUCKNAME {g_id}`")
                 continue
 
+            # -- Layer 1: real-time chat_member events (requires bot to be admin) --
+            member_evt = update.get("chat_member", {})
+            if member_evt:
+                _handle_chat_member_event(member_evt)
+                continue
+
             message  = update.get("message", {})
             chat_id  = str(message.get("chat", {}).get("id", ""))
             document = message.get("document")
             text     = message.get("text", "").strip()
+
+            # -- Layer 1 fallback: new_chat_members / left_chat_member in messages --
+            # (fires even when bot is not admin — less reliable but works everywhere)
+            new_members = message.get("new_chat_members", [])
+            if new_members:
+                _handle_new_members_message(chat_id, new_members)
+
+            left_member = message.get("left_chat_member")
+            if left_member and not left_member.get("is_bot"):
+                _handle_left_member_message(chat_id, left_member)
 
             # QM Notifier — detect by content
             if "NEW TRIP" in text and "HAS BEEN ASSIGNED" in text:
@@ -414,6 +448,11 @@ def poll_for_uploads():
                             log.warning(f"QM message in group {chat_id} — no truck matched")
                 except Exception as e:
                     log.error(f"QM Notifier parse error: {e}", exc_info=True)
+
+            # Natural language trigger — "plan route" in any driver group
+            if text.lower().strip() == "plan route":
+                _handle_plan_route_from_group(chat_id)
+                continue
 
             if text.startswith("/"):
                 text = text.split("@")[0]
@@ -452,6 +491,24 @@ def poll_for_uploads():
             elif text.startswith("/updategroup"):
                 _handle_updategroup(text, chat_id)
                 continue
+            elif text.startswith("/active"):
+                _handle_active(chat_id)
+                continue
+            elif text.startswith("/relayapp"):
+                _handle_relayapp(chat_id)
+                continue
+            elif text.startswith("/planroute"):
+                try:
+                    _handle_planroute(text, chat_id)
+                except Exception as e:
+                    _send_to(chat_id, f"❌ Error: `{e}`")
+                continue
+            elif text.startswith("/confirm"):
+                _handle_driver_confirm(chat_id, message)
+                continue
+            elif text.startswith("/wrong"):
+                _handle_driver_wrong(chat_id, message)
+                continue
 
             if chat_id != ADMIN_CHAT_ID:
                 continue
@@ -469,19 +526,46 @@ def poll_for_uploads():
                     elif text.startswith("/resetpilot"):   _handle_resetpilot()
                     elif text.startswith("/findload"):     _handle_findload(text, chat_id)
                     elif text.startswith("/testroute"):    _handle_testroute(text)
-                    elif text.startswith("/planroute"):     _handle_planroute(text, chat_id)
-                    elif text.startswith("/truckstats"):    _handle_truckstats(text, chat_id)
-                    elif text.startswith("/routelist"):     _handle_routelist(chat_id)
+                    elif text.startswith("/truckstats"):      _handle_truckstats(text, chat_id)
+                    elif text.startswith("/routelist"):       _handle_routelist(chat_id)
+                    elif text.startswith("/classify_truck"):  _handle_classify_truck(text, chat_id)
+                    elif text.startswith("/setnewsystem"):    _handle_setnewsystem(text)
+                    elif text.startswith("/weeklyreport"):    _handle_weeklyreport()
+                    elif text.startswith("/dedupetrucks"):    _handle_dedupetrucks()
+                    elif text.startswith("/syncsamsara"):     _handle_syncsamsara(text)
+                    elif text.startswith("/assigndriver"):    _handle_assigndriver(text)
+                    elif text.startswith("/removedriver"):    _handle_removedriver(text)
+                    elif text.startswith("/whodrives"):       _handle_whodrives(text)
+                    elif text.startswith("/driverlog"):       _handle_driverlog(text)
+                    elif text.startswith("/driverlist"):      _handle_driverlist()
+                    elif text.startswith("/alertcount"):      _handle_alertcount()
+                    elif text.startswith("/resumeall"):       _handle_resumeall()
                     else:
                         _send_to(ADMIN_CHAT_ID,
                             "Available commands:\n"
                             "/addtruck Unit4821 -100123456\n"
                             "/setgroup Unit4821 -100123456\n"
                             "/listtruck\n/removetruck Unit4821\n"
-                            "/findstop 0792  ? any group\n"
-                            "/route 0792  ? any group\n"
-                            "/qmload 0792  ? read QM load by truck\n"
-                            "/findload 8656  ? search QM trip"
+                            "/setnewsystem 0801 0802  — move trucks to Relay card\n"
+                            "/alertcount  — how many drivers receiving alerts (by system)\n"
+                            "/weeklyreport  — resend weekly Excel reports now\n"
+                            "/findstop 0792  — any group\n"
+                            "/route 0792  — any group\n"
+                            "/qmload 0792  — read QM load by truck\n"
+                            "/findload 8656  — search QM trip\n"
+                            "/classify_truck 0792  — show classifier status+signals\n"
+                            "\nDriver group management:\n"
+                            "/assigndriver 0792 John Smith -100GROUP_ID\n"
+                            "/removedriver 0792  — pause alerts, clear driver\n"
+                            "/whodrives 0792  — show driver + alert status\n"
+                            "/driverlog 0792  — last 10 group events\n"
+                            "/driverlist  — all trucks with driver + status\n"
+                            "/resumeall  — restore alerts paused by heartbeat false-positive\n"
+                            "\nIn driver groups:\n"
+                            "/relayapp  — move group trucks to new Relay card\n"
+                            "/planroute 0792  — full fuel plan (works in any group)\n"
+                            "/confirm  — driver confirms assignment\n"
+                            "/wrong  — wrong driver in group"
                         )
                 except Exception as e:
                     log.error(f"Command error: {e}", exc_info=True)
@@ -492,13 +576,14 @@ def poll_for_uploads():
                 _send_to(ADMIN_CHAT_ID, "📂 Send CSV/XLSX to update prices, or use a command.")
                 continue
 
-            filename   = document.get("file_name", "upload")
+            filename   = document.get("file_name", "upload").strip()
             file_id    = document.get("file_id")
-            ext        = filename.lower().split(".")[-1]
-            if ext not in ("csv", "xlsx", "zip"):
-                _send_to(ADMIN_CHAT_ID, f"❌ Unsupported file: `{filename}`")
+            ext        = filename.lower().split(".")[-1].strip()
+            if ext not in ("csv", "xlsx", "xls", "zip"):
+                _send_to(ADMIN_CHAT_ID, f"❌ Unsupported file: `{filename}`\nSend .csv for old system or .xlsx/.xls for new Relay system.")
                 continue
-            _send_to(ADMIN_CHAT_ID, f"📥 Received `{filename}` — processing...")
+            system_label = "new Relay card (Pilot/FJ)" if ext in ("xls", "xlsx") else "old card (all stops)"
+            _send_to(ADMIN_CHAT_ID, f"📥 Received `{filename}` — processing {system_label}...")
             file_url = _get_file_url(file_id)
             if not file_url:
                 _send_to(ADMIN_CHAT_ID, "❌ Could not retrieve file.")
@@ -688,8 +773,24 @@ def _handle_listtruck():
     if not trucks:
         _send_to(ADMIN_CHAT_ID, "No trucks registered.")
         return
-    lines = [f"• *{t['vehicle_name']}*  `{t.get('telegram_group_id') or '— no group'}`" for t in trucks]
-    chunks = [lines[i:i+50] for i in range(0, len(lines), 50)]
+
+    old_trucks = [t for t in trucks if (t.get('fuel_card_system') or 'old') == 'old']
+    new_trucks = [t for t in trucks if (t.get('fuel_card_system') or 'old') == 'new']
+
+    def _fmt(t):
+        grp = t.get('telegram_group_id') or '— no group'
+        return f"• *{t['vehicle_name']}*  `{grp}`"
+
+    all_lines = []
+    if old_trucks:
+        all_lines.append(f"*🟡 Old System (EFS/WEX) — {len(old_trucks)} trucks:*")
+        all_lines += [_fmt(t) for t in old_trucks]
+        all_lines.append("")
+    if new_trucks:
+        all_lines.append(f"*🟢 New System (Relay/Pilot FJ) — {len(new_trucks)} trucks:*")
+        all_lines += [_fmt(t) for t in new_trucks]
+
+    chunks = [all_lines[i:i+50] for i in range(0, len(all_lines), 50)]
     for i, chunk in enumerate(chunks):
         header = f"🚛 *Trucks ({len(trucks)} total)*" + (f" — page {i+1}/{len(chunks)}" if len(chunks) > 1 else "") + "\n"
         _send_to(ADMIN_CHAT_ID, header + "\n".join(chunk))
@@ -719,25 +820,80 @@ def _handle_resetpilot():
 def _handle_dbstats():
     from database import db_cursor
     with db_cursor() as cur:
+        # Old EFS/WEX system — fuel_stops table
         cur.execute("""
-            SELECT source, COUNT(*) AS total, COUNT(diesel_price) AS with_price,
-                   ROUND(AVG(diesel_price)::numeric,3) AS avg_price,
-                   MIN(diesel_price) AS min_price, MAX(diesel_price) AS max_price,
-                   MAX(price_updated) AS last_updated
-            FROM fuel_stops WHERE has_diesel=TRUE GROUP BY source ORDER BY source
+            SELECT
+                network,
+                COUNT(*)                                    AS total,
+                COUNT(discounted_price)                     AS priced,
+                ROUND(AVG(discounted_price)::numeric, 3)    AS avg_price,
+                MIN(discounted_price)                       AS min_price,
+                MAX(discounted_price)                       AS max_price,
+                MAX(price_updated)                          AS last_updated
+            FROM fuel_stops
+            GROUP BY network
+            ORDER BY network
         """)
-        rows = cur.fetchall()
-    if not rows:
-        _send_to(ADMIN_CHAT_ID, "❌ No fuel stops in DB.")
-        return
-    lines = ["📊 *Fuel Stop DB Stats*\n"]
-    for r in rows:
-        s = (r["source"] or "unknown").upper()
-        upd = r["last_updated"].strftime("%Y-%m-%d %H:%M UTC") if r["last_updated"] else "never"
-        lines += [f"*{s}*",
-                  f"  Stops: {r['total']}  Priced: {r['with_price']}  Missing: {r['total']-r['with_price']}",
-                  f"  Price: ${r['min_price'] or 0:.3f} – ${r['max_price'] or 0:.3f}  (avg ${r['avg_price'] or 0:.3f})",
-                  f"  Updated: {upd}\n"]
+        old_rows = cur.fetchall()
+        cur.execute("SELECT COUNT(*) AS total FROM fuel_stops")
+        old_total = cur.fetchone()["total"]
+
+        # New Relay system — pilot_contracted_prices table
+        cur.execute("""
+            SELECT
+                COUNT(*)                                    AS total,
+                COUNT(discounted_price)                     AS priced,
+                ROUND(AVG(discounted_price)::numeric, 3)    AS avg_price,
+                MIN(discounted_price)                       AS min_price,
+                MAX(discounted_price)                       AS max_price,
+                MAX(price_updated)                          AS last_updated
+            FROM pilot_contracted_prices
+        """)
+        relay_row = cur.fetchone()
+
+        # Truck counts per system
+        cur.execute("""
+            SELECT fuel_card_system, COUNT(*) AS cnt
+            FROM trucks WHERE is_active = TRUE
+            GROUP BY fuel_card_system
+        """)
+        truck_rows = {r["fuel_card_system"]: r["cnt"] for r in cur.fetchall()}
+
+    lines = ["📊 *Fuel Price DB Stats*\n"]
+
+    # Old system section
+    lines.append(f"*🟡 EFS/WEX System (old card)* — {old_total} stops total")
+    lines.append(f"  Trucks on this system: {truck_rows.get('old', 0)}")
+    if old_rows:
+        for r in old_rows:
+            net = (r["network"] or "other").replace("_", " ").title()
+            upd = r["last_updated"].strftime("%b %d %H:%M UTC") if r["last_updated"] else "never"
+            if r["priced"]:
+                lines.append(f"  {net}: {r['priced']}/{r['total']} priced  "
+                             f"${r['min_price'] or 0:.3f}–${r['max_price'] or 0:.3f} "
+                             f"(avg ${r['avg_price'] or 0:.3f})  upd {upd}")
+            else:
+                lines.append(f"  {net}: {r['total']} stops — no prices")
+    else:
+        lines.append("  ⚠️ No stops loaded")
+
+    lines.append("")
+
+    # New Relay system section
+    r = relay_row
+    lines.append(f"*🟢 Relay System (new card)* — {r['total']} Pilot/Flying J stops")
+    lines.append(f"  Trucks on this system: {truck_rows.get('new', 0)}")
+    if r["total"]:
+        upd = r["last_updated"].strftime("%b %d %H:%M UTC") if r["last_updated"] else "never"
+        if r["priced"]:
+            lines.append(f"  Priced: {r['priced']}/{r['total']}  "
+                         f"${r['min_price'] or 0:.3f}–${r['max_price'] or 0:.3f} "
+                         f"(avg ${r['avg_price'] or 0:.3f})  upd {upd}")
+        else:
+            lines.append("  ⚠️ Stops loaded but no prices — upload XLS to add prices")
+    else:
+        lines.append("  ⚠️ No stops loaded — upload Relay XLS file")
+
     _send_to(ADMIN_CHAT_ID, "\n".join(lines))
 
 
@@ -930,7 +1086,7 @@ def _handle_testroute(text: str) -> None:
 
 
 def _handle_findstop(text: str, chat_id: str):
-    from database import get_all_diesel_stops
+    from database import get_all_diesel_stops_for_system, get_truck_card_system
     from samsara_client import get_combined_vehicle_data
     from truck_stop_finder import haversine_miles
 
@@ -955,16 +1111,27 @@ def _handle_findstop(text: str, chat_id: str):
     fuel  = truck.get("fuel_pct", 0)
     speed = truck.get("speed_mph", 0)
     vname = truck.get("vehicle_name", truck_number)
-    all_stops = get_all_diesel_stops()
+
+    # Use the correct price table for this truck's card system
+    card_system   = get_truck_card_system(vname)
+    system_label  = "Relay (Pilot/FJ)" if card_system == 'new' else "EFS/WEX (all stops)"
+    all_stops     = get_all_diesel_stops_for_system(card_system)
+
     nearby = sorted(
         [{ **s, "distance_miles": round(haversine_miles(lat, lng, float(s["latitude"]), float(s["longitude"])), 1)}
          for s in all_stops if haversine_miles(lat, lng, float(s["latitude"]), float(s["longitude"])) <= 50 and s.get("diesel_price")],
         key=lambda s: s["diesel_price"]
     )[:3]
     if not nearby:
-        _send_to(chat_id, f"⚠️ No fuel stops within 50 miles of *{vname}*.\n📍 GPS: `{lat:.5f}, {lng:.5f}`")
+        _send_to(chat_id, f"⚠️ No fuel stops within 50 miles of *{vname}* ({system_label}).\n📍 GPS: `{lat:.5f}, {lng:.5f}`")
         return
-    lines = [f"⛽ *Fuel Stops — Truck {vname}*", f"📍 ⛽ {fuel:.0f}% fuel | 🧭 {speed:.0f} mph", f"🌐 GPS: `{lat:.5f}, {lng:.5f}`", f"🔍 Top 3 cheapest within 50 miles\n"]
+    lines = [
+        f"⛽ *Fuel Stops — Truck {vname}*",
+        f"💳 System: *{system_label}*",
+        f"📍 ⛽ {fuel:.0f}% fuel | 🧭 {speed:.0f} mph",
+        f"🌐 GPS: `{lat:.5f}, {lng:.5f}`",
+        f"🔍 Top 3 cheapest within 50 miles\n",
+    ]
     for i, s in enumerate(nearby, 1):
         addr = ", ".join(filter(None, [s.get("address",""), s.get("city",""), s.get("state","")]))
         lines += [f"*#{i} — {s['store_name']}*", f"📌 {addr}", f"🛣 {s['distance_miles']} mi away",
@@ -1244,6 +1411,101 @@ def _handle_stopvisits(text: str, chat_id: str) -> None:
     _send_to(chat_id, "\n".join(lines))
 
 
+def _handle_plan_route_from_group(chat_id: str) -> None:
+    """Triggered by 'plan route' text in a driver group.
+
+    Identifies the truck from the group, fetches GPS from Samsara, then
+    returns the single BEST next fuel stop ahead — filtered by the truck's
+    fuel-card system (old EFS/WEX = all stops; new Relay = Pilot/FJ only).
+    """
+    from database import get_truck_by_group, get_truck_card_system
+    from samsara_client import get_combined_vehicle_data
+    from truck_stop_finder import find_best_stops
+    from config import DEFAULT_TANK_GAL, DEFAULT_MPG
+
+    truck_row = get_truck_by_group(chat_id)
+    if not truck_row:
+        _send_to(chat_id, "❌ No truck is assigned to this group. Ask admin to run `/setgroup`.")
+        return
+
+    vname = truck_row["vehicle_name"]
+    tank_gal = truck_row.get("tank_capacity_gal") or DEFAULT_TANK_GAL
+    mpg      = truck_row.get("avg_mpg") or DEFAULT_MPG
+
+    # Live Samsara data — GPS, fuel %, heading, speed
+    try:
+        vehicles = get_combined_vehicle_data()
+    except Exception as e:
+        _send_to(chat_id, f"❌ Could not reach Samsara: `{e}`")
+        return
+    truck = next((v for v in vehicles
+                  if vname.lower() in v.get("vehicle_name", "").lower()), None)
+    if not truck:
+        _send_to(chat_id, f"❌ Truck *{vname}* not found in Samsara right now.")
+        return
+
+    lat     = truck.get("lat")
+    lng     = truck.get("lng")
+    fuel    = truck.get("fuel_pct") or 0
+    heading = truck.get("heading") or 0
+    speed   = truck.get("speed_mph") or 0
+    if not lat or not lng:
+        _send_to(chat_id, f"❌ No GPS for truck *{vname}* — cannot plan.")
+        return
+
+    # Find the SINGLE best next stop, filtered by this truck's card system
+    card_system = get_truck_card_system(vname)
+    best, _alt = find_best_stops(
+        lat, lng, heading, speed, fuel, tank_gal, mpg,
+        card_system=card_system,
+    )
+
+    if not best:
+        scope = "Pilot/Flying J only" if card_system == 'new' else "all networks"
+        _send_to(
+            chat_id,
+            f"⚠️ No fuel stops found ahead for truck *{vname}* "
+            f"({scope}).\n📍 GPS: `{lat:.5f}, {lng:.5f}`",
+        )
+        return
+
+    # Compose the message — one stop, clean
+    name      = best.get("store_name", "Unknown")
+    addr_part = ", ".join(filter(None, [
+        best.get("address", ""), best.get("city", ""), best.get("state", ""),
+    ]))
+    dist      = best.get("distance_miles", 0)
+    price     = best.get("diesel_price")
+    net       = best.get("net_price")
+    slat      = best.get("latitude")
+    slng      = best.get("longitude")
+    maps_url  = f"https://maps.google.com/?q={slat},{slng}" if slat and slng else None
+    fill_gal  = round(tank_gal * (1 - fuel / 100), 0)
+
+    card_label = "Relay (Pilot/Flying J only)" if card_system == 'new' else "EFS / WEX (all stops)"
+
+    lines = [
+        f"⛽ FUEL PLAN — TRUCK {vname} ⛽",
+        f"⛽ Current Fuel: {fuel:.0f}%   💳 Card: {card_label}",
+        f"🎯 NEXT STOP (In {dist:.0f} miles):",
+        "",
+        name,
+    ]
+    if addr_part:
+        lines.append(f"📌 {addr_part}")
+    if maps_url:
+        lines.append(f"🗺️ [Directions]({maps_url})")
+    if price:
+        price_line = f"💰 Card: ${price:.3f}/gal"
+        if net is not None and net != price:
+            price_line += f"  (net after IFTA: ${net:.3f})"
+        lines.append(price_line)
+    if fill_gal > 0:
+        lines += ["💧 INSTRUCTIONS:", f"Full Tank Fill (~{fill_gal:.0f} gallons)"]
+
+    _send_to(chat_id, "\n".join(lines))
+
+
 def _handle_planroute(text: str, chat_id: str) -> None:
     """/planroute <truck> — full IFTA-aware fuel plan for entire route"""
     parts = text.strip().split()
@@ -1435,10 +1697,26 @@ def _handle_flags(text: str, chat_id: str) -> None:
         _send_to(chat_id, "\n".join(lines))
 
 
+def _send_excel_to_admin(data: bytes, filename: str, caption: str) -> None:
+    """Send an Excel file to ADMIN_CHAT_ID via sendDocument. Raises on failure."""
+    url  = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
+    resp = requests.post(
+        url,
+        data={"chat_id": ADMIN_CHAT_ID, "caption": caption},
+        files={"document": (filename, data,
+                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+        timeout=60,
+    )
+    if not resp.ok or not resp.json().get("ok"):
+        raise RuntimeError(f"Telegram sendDocument failed: {resp.text[:200]}")
+
+
 def send_weekly_truck_report() -> None:
     """Send per-truck Excel report every Monday alongside fleet summary."""
     import tempfile, os
     from truck_report import build_truck_report
+    from datetime import datetime, timezone
+    week = datetime.now(timezone.utc).strftime("%b %d %Y")
     try:
         with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as f:
             path = f.name
@@ -1446,19 +1724,40 @@ def send_weekly_truck_report() -> None:
         with open(path, "rb") as f:
             data = f.read()
         os.unlink(path)
-        # Send as file to admin
-        import requests
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
-        from datetime import datetime, timezone
-        week = datetime.now(timezone.utc).strftime("%b %d %Y")
-        requests.post(url, data={
-            "chat_id":  ADMIN_CHAT_ID,
-            "caption":  f"📊 Per-Truck Weekly Report  |  {week}",
-        }, files={"document": (f"DieselUp_Trucks_{week.replace(' ','_')}.xlsx", data,
-                               "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")})
+        _send_excel_to_admin(
+            data,
+            f"DieselUp_Trucks_{week.replace(' ','_')}.xlsx",
+            f"📊 Per-Truck Weekly Report  |  {week}",
+        )
         log.info("Per-truck Excel report sent to admin")
     except Exception as e:
         log.error(f"Truck report send failed: {e}", exc_info=True)
+        _send_to(ADMIN_CHAT_ID, f"❌ *Weekly per-truck Excel failed:*\n`{e}`")
+
+
+def send_weekly_fleet_excel() -> None:
+    """Send 4-sheet fleet summary Excel (Summary, Compliance, Flags, IFTA)."""
+    import tempfile, os
+    from weekly_report import get_real_data, build_report
+    from datetime import datetime, timezone
+    week = datetime.now(timezone.utc).strftime("%b %d %Y")
+    try:
+        summary, compliance, flags, ifta = get_real_data(days=7)
+        with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as f:
+            path = f.name
+        build_report(summary, compliance, flags, ifta, path)
+        with open(path, "rb") as f:
+            data = f.read()
+        os.unlink(path)
+        _send_excel_to_admin(
+            data,
+            f"DieselUp_Fleet_{week.replace(' ','_')}.xlsx",
+            f"📋 Fleet Weekly Report  |  {week}\n4 sheets: Summary · Compliance · Flags · IFTA",
+        )
+        log.info("Fleet summary Excel report sent to admin")
+    except Exception as e:
+        log.error(f"Fleet Excel report failed: {e}", exc_info=True)
+        _send_to(ADMIN_CHAT_ID, f"❌ *Weekly fleet Excel failed:*\n`{e}`")
 
 
 def send_weekly_savings_report() -> None:
@@ -1642,4 +1941,738 @@ def send_weekly_savings_report() -> None:
 
     # Send ONLY to admin (owner) — never to dispatcher group or driver groups
     _send_to(ADMIN_CHAT_ID, msg)
+
+
+def _handle_active(chat_id: str) -> None:
+    """/active — fleet-wide activity status summary from the truck classifier."""
+    from database import db_cursor
+    from datetime import datetime, timezone
+
+    try:
+        with db_cursor() as cur:
+            cur.execute("""
+                SELECT activity_status,
+                       COUNT(*)               AS cnt,
+                       MAX(status_updated_at) AS last_update
+                  FROM trucks
+                 WHERE is_active = TRUE
+                 GROUP BY activity_status
+                 ORDER BY cnt DESC
+            """)
+            rows = cur.fetchall()
+    except Exception as e:
+        _send_to(chat_id, f"❌ Error querying truck statuses: `{e}`")
+        return
+
+    counts: dict = {}
+    last_update   = None
+
+    for row in rows:
+        key = row["activity_status"] or "unclassified"
+        counts[key] = int(row["cnt"])
+        ts = row["last_update"]
+        if ts and (last_update is None or ts > last_update):
+            last_update = ts
+
+    if not counts:
+        _send_to(chat_id, "No truck status data yet — classifier runs every 30 min after startup.")
+        return
+
+    total = sum(counts.values())
+    STATUS_DISPLAY = [
+        ("active",       "🟢 Active"),
+        ("idle",         "🟡 Idle"),
+        ("at_yard",      "🏠 At Yard"),
+        ("in_shop",      "🔧 In Shop"),
+        ("unassigned",   "⚪ Unassigned"),
+        ("unknown",      "❓ Unknown"),
+        ("unclassified", "➖ Unclassified"),
+    ]
+
+    lines = [f"🚛 *Fleet Status ({total} trucks)*"]
+    for key, label in STATUS_DISPLAY:
+        n = counts.get(key, 0)
+        if n:
+            lines.append(f"{label}: {n}")
+
+    if last_update:
+        now = datetime.now(timezone.utc)
+        if last_update.tzinfo is None:
+            last_update = last_update.replace(tzinfo=timezone.utc)
+        mins = max(0, int((now - last_update).total_seconds() / 60))
+        lines.append(f"\n_Last updated: {mins} min ago_")
+
+    _send_to(chat_id, "\n".join(lines))
+
+
+def _handle_classify_truck(text: str, chat_id: str) -> None:
+    """/classify_truck <unit> — show current classifier status + raw signals for one truck."""
+    import json as _json
+    from database import db_cursor
+    from datetime import datetime, timezone
+    from config import CLASSIFIER_ENFORCEMENT_MODE
+
+    parts = text.strip().split()
+    if len(parts) < 2:
+        _send_to(chat_id, "Usage: `/classify_truck 0792`")
+        return
+
+    unit = parts[1].strip()
+
+    with db_cursor() as cur:
+        cur.execute(
+            """
+            SELECT vehicle_name, activity_status, status_updated_at, status_signals
+              FROM trucks
+             WHERE vehicle_name ILIKE %s AND is_active = TRUE
+             LIMIT 1
+            """,
+            (f"%{unit}%",),
+        )
+        row = cur.fetchone()
+
+    if not row:
+        _send_to(chat_id, f"❌ No active truck matching `{unit}` found in DB.")
+        return
+
+    name    = row["vehicle_name"]
+    status  = row["activity_status"] or "unclassified"
+    updated = row["status_updated_at"]
+    signals = row["status_signals"]
+
+    STATUS_EMOJI = {
+        "active":       "🟢",
+        "idle":         "🟡",
+        "at_yard":      "🏠",
+        "in_shop":      "🔧",
+        "unassigned":   "⚪",
+        "unknown":      "❓",
+        "unclassified": "➖",
+    }
+    emoji = STATUS_EMOJI.get(status, "❓")
+
+    lines = [f"🚛 *Truck {name} — Classifier*", f"{emoji} Status: *{status}*"]
+
+    if signals:
+        try:
+            sig = signals if isinstance(signals, dict) else _json.loads(signals)
+            lines.append("\n*Signals:*")
+            lines.append(f"  miles\\_driven\\_48h:    {sig.get('miles_driven_48h', 'n/a')}")
+            lines.append(f"  engine\\_hours\\_24h:    {sig.get('engine_hours_24h', 'n/a')}")
+            lines.append(f"  hours\\_at\\_yard:       {sig.get('hours_at_yard', 'n/a')}")
+            lines.append(f"  hours\\_at\\_shop:       {sig.get('hours_at_shop', 'n/a')}")
+            lines.append(f"  has\\_assigned\\_driver: {sig.get('has_assigned_driver', 'n/a')}")
+        except Exception:
+            lines.append("_(signals unavailable)_")
+    else:
+        lines.append("_(not yet classified — classifier runs every 30 min)_")
+
+    if updated:
+        now = datetime.now(timezone.utc)
+        if updated.tzinfo is None:
+            updated = updated.replace(tzinfo=timezone.utc)
+        mins = max(0, int((now - updated).total_seconds() / 60))
+        lines.append(f"\n_Updated {mins} min ago_")
+
+    lines.append(f"_Enforcement mode: `{CLASSIFIER_ENFORCEMENT_MODE}`_")
+
+    _send_to(chat_id, "\n".join(lines))
     log.info(f"Weekly owner report sent — ${total_savings:,.2f} savings")
+
+
+def _handle_weeklyreport() -> None:
+    """/weeklyreport — manually resend all weekly Excel reports right now."""
+    _send_to(ADMIN_CHAT_ID, "📊 Generating weekly reports now...")
+    send_weekly_savings_report()
+    send_weekly_fleet_excel()
+    send_weekly_truck_report()
+
+
+def _handle_syncsamsara(text: str) -> None:
+    """/syncsamsara [new] — register/re-activate all Samsara trucks missing from DB.
+    Add 'new' to also set them all to Relay card system.
+    """
+    from database import auto_register_truck
+    from samsara_client import get_combined_vehicle_data
+
+    set_new_card = "new" in text.lower()
+
+    _send_to(ADMIN_CHAT_ID, "🔄 Pulling truck list from Samsara...")
+    try:
+        vehicles = get_combined_vehicle_data()
+    except Exception as e:
+        _send_to(ADMIN_CHAT_ID, f"❌ Samsara error: `{e}`")
+        return
+
+    changed    = []   # newly registered or re-activated
+    already_ok = 0
+
+    for v in vehicles:
+        vname = v.get("vehicle_name", "").strip()
+        vid   = v.get("vehicle_id",   "").strip()
+        if not vname:
+            continue
+        if auto_register_truck(vid, vname):
+            changed.append(vname)
+        else:
+            already_ok += 1
+
+    if set_new_card:
+        from database import set_truck_card_system
+        for v in vehicles:
+            vname = v.get("vehicle_name", "").strip()
+            if vname:
+                set_truck_card_system(vname, 'new')
+
+    lines = [f"📡 *Samsara sync complete* — {len(vehicles)} trucks in Samsara"]
+    if changed:
+        truck_lines = "\n".join(f"  • {n}" for n in changed)
+        lines.append(f"✅ *Added/re-activated ({len(changed)}):*\n{truck_lines}")
+    else:
+        lines.append(f"✅ All {already_ok} trucks already registered and active.")
+    if set_new_card:
+        lines.append(f"🔄 All trucks set to *new Relay card* (Pilot/FJ only).")
+    _send_to(ADMIN_CHAT_ID, "\n\n".join(lines))
+
+
+def _handle_dedupetrucks() -> None:
+    """/dedupetrucks — remove duplicate truck DB rows, keep the most complete name."""
+    from database import cleanup_duplicate_trucks
+    try:
+        removed = cleanup_duplicate_trucks()
+        if not removed:
+            _send_to(ADMIN_CHAT_ID, "✅ No duplicate trucks found.")
+            return
+        lines = ["🧹 *Duplicate trucks cleaned up:*"]
+        for keep, dupe in removed:
+            lines.append(f"  • Kept `{keep}` — removed `{dupe}`")
+        _send_to(ADMIN_CHAT_ID, "\n".join(lines))
+    except Exception as e:
+        _send_to(ADMIN_CHAT_ID, f"❌ Dedupe failed: `{e}`")
+
+
+def _handle_setnewsystem(text: str) -> None:
+    """/setnewsystem <truck1> [truck2 ...] — move trucks to new Relay card (Pilot/FJ only).
+    Auto-registers trucks from Samsara if they aren't in the DB yet.
+    """
+    from database import set_truck_card_system, auto_register_truck, get_all_registered_trucks
+    raw = text.strip()
+    after_cmd = raw.split(None, 1)[1] if len(raw.split()) > 1 else ""
+    if not after_cmd:
+        _send_to(ADMIN_CHAT_ID, "Usage: `/setnewsystem all` or `/setnewsystem 1079 1190 1655`")
+        return
+
+    # /setnewsystem all — move every active truck at once
+    if after_cmd.strip().lower() == "all":
+        trucks = get_all_registered_trucks()
+        count = 0
+        for t in trucks:
+            if set_truck_card_system(t["vehicle_name"], 'new'):
+                count += 1
+        _send_to(ADMIN_CHAT_ID,
+            f"✅ *All trucks moved to new Relay card (Pilot/Flying J only)*\n"
+            f"{len(trucks)} trucks updated.")
+        return
+
+    tokens = [t.strip().strip(",") for t in after_cmd.replace(",", " ").split() if t.strip().strip(",")]
+    tokens = list(dict.fromkeys(tokens))  # deduplicate, preserve order
+
+    moved_full  = []  # actual DB names successfully updated
+    registered  = []  # trucks auto-registered from Samsara then moved
+    not_found   = []  # not in DB and not in Samsara
+
+    # Build Samsara lookup once for auto-registration of missing trucks
+    samsara_map = {}  # partial_number -> vehicle_name as stored in Samsara
+    try:
+        from samsara_client import get_combined_vehicle_data
+        vehicles = get_combined_vehicle_data()
+        for v in vehicles:
+            vname = v.get("vehicle_name", "")
+            vid   = v.get("vehicle_id", "")
+            samsara_map[vname] = (vname, vid)
+    except Exception:
+        pass  # Samsara unavailable — only DB matching will work
+
+    for token in tokens:
+        matched = set_truck_card_system(token, 'new')
+        if matched:
+            moved_full.extend(matched)
+            continue
+
+        # Not in DB — try to find in Samsara by number prefix and auto-register
+        samsara_match = next(
+            ((vname, vid) for vname, vid in samsara_map.values()
+             if vname == token
+             or vname.startswith(token + ' ')
+             or vname.startswith(token + '-')),
+            None
+        )
+        if samsara_match:
+            s_name, s_vid = samsara_match
+            try:
+                auto_register_truck(s_vid, s_name)
+                # Now set card system on the newly registered truck
+                matched2 = set_truck_card_system(token, 'new')
+                if matched2:
+                    registered.extend(matched2)
+                    continue
+            except Exception as e:
+                log.warning(f"Auto-register failed for {token}: {e}")
+
+        not_found.append(token)
+
+    lines = []
+    all_moved = moved_full + registered
+    if all_moved:
+        truck_list = "\n".join(f"  • {n}" for n in all_moved)
+        lines.append(f"✅ *Moved to new Relay card (Pilot/Flying J only):*\n{truck_list}")
+    if registered:
+        lines.append(f"_({len(registered)} auto-registered from Samsara)_")
+    if not_found:
+        lines.append(
+            f"❌ *Not found in DB or Samsara:* " + ", ".join(f"`{n}`" for n in not_found) +
+            f"\nCheck truck numbers or run `/listtruck` to see registered names."
+        )
+    _send_to(ADMIN_CHAT_ID, "\n\n".join(lines) or "No trucks updated.")
+
+
+# -- Driver group change detection handlers -----------------------------------
+
+def _handle_chat_member_event(evt: dict) -> None:
+    """Handle chat_member update (requires bot to be admin in group)."""
+    from database import get_truck_by_group, log_driver_group_event, set_truck_alert_paused
+    try:
+        chat    = evt.get("chat", {})
+        gid     = str(chat.get("id", ""))
+        old_s   = evt.get("old_chat_member", {}).get("status", "")
+        new_s   = evt.get("new_chat_member", {}).get("status", "")
+        user    = evt.get("new_chat_member", {}).get("user", {})
+        is_bot  = user.get("is_bot", False)
+        uname   = user.get("first_name", "") + (" " + user.get("last_name", "")).rstrip()
+
+        if is_bot:
+            return  # bot join/leave handled by my_chat_member
+
+        truck = get_truck_by_group(gid)
+        if not truck:
+            return  # not a truck group
+
+        vname = truck["vehicle_name"]
+
+        # Member joined
+        if old_s in ("left", "kicked") and new_s in ("member", "administrator", "restricted"):
+            log_driver_group_event(vname, "joined", gid, uname, "realtime")
+            set_truck_alert_paused(vname, False, None, group_verified=False)
+            _send_to(gid,
+                f"👋 *DieselUp Bot here.* You're assigned to Truck *{vname}*.\n"
+                f"Reply /confirm to activate fuel alerts.\n"
+                f"If you're not the driver, reply /wrong"
+            )
+            _send_to(ADMIN_CHAT_ID,
+                f"👤 New member in *Truck {vname}* group — awaiting driver confirmation\n"
+                f"Group: `{gid}`  Member: {uname}"
+            )
+
+        # Member left or kicked
+        elif old_s in ("member", "administrator", "restricted") and new_s in ("left", "kicked"):
+            log_driver_group_event(vname, "left", gid, uname, "realtime")
+            set_truck_alert_paused(vname, True, "driver_left", group_verified=False)
+            _send_to(ADMIN_CHAT_ID,
+                f"🚪 *{vname} — Driver Left Group*\n"
+                f"Group: `{gid}`\n"
+                f"Driver: {uname}\n"
+                f"Alerts: PAUSED ⏸\n"
+                f"To reassign: `/assigndriver {vname} NAME {gid}`"
+            )
+    except Exception as e:
+        log.warning(f"_handle_chat_member_event error: {e}")
+
+
+def _handle_new_members_message(chat_id: str, new_members: list) -> None:
+    """Fallback: new_chat_members in message update (works without bot-admin)."""
+    from database import get_truck_by_group, log_driver_group_event, set_truck_alert_paused
+    try:
+        truck = get_truck_by_group(chat_id)
+        if not truck:
+            return
+        vname = truck["vehicle_name"]
+        for user in new_members:
+            if user.get("is_bot"):
+                continue
+            uname = user.get("first_name", "") + (" " + user.get("last_name", "")).rstrip()
+            log_driver_group_event(vname, "joined", chat_id, uname, "realtime")
+            set_truck_alert_paused(vname, False, None, group_verified=False)
+            _send_to(chat_id,
+                f"👋 *DieselUp Bot here.* You're assigned to Truck *{vname}*.\n"
+                f"Reply /confirm to activate fuel alerts.\n"
+                f"If you're not the driver, reply /wrong"
+            )
+            _send_to(ADMIN_CHAT_ID,
+                f"👤 New member in *Truck {vname}* group — awaiting driver confirmation\n"
+                f"Group: `{chat_id}`  Member: {uname}"
+            )
+    except Exception as e:
+        log.warning(f"_handle_new_members_message error: {e}")
+
+
+def _handle_left_member_message(chat_id: str, user: dict) -> None:
+    """Fallback: left_chat_member in message update."""
+    from database import get_truck_by_group, log_driver_group_event, set_truck_alert_paused
+    try:
+        truck = get_truck_by_group(chat_id)
+        if not truck:
+            return
+        vname = truck["vehicle_name"]
+        uname = user.get("first_name", "") + (" " + user.get("last_name", "")).rstrip()
+        log_driver_group_event(vname, "left", chat_id, uname, "realtime")
+        set_truck_alert_paused(vname, True, "driver_left", group_verified=False)
+        _send_to(ADMIN_CHAT_ID,
+            f"🚪 *{vname} — Driver Left Group*\n"
+            f"Driver: {uname}\nGroup: `{chat_id}`\n"
+            f"Alerts: PAUSED ⏸\n"
+            f"To reassign: `/assigndriver {vname} NAME {chat_id}`"
+        )
+    except Exception as e:
+        log.warning(f"_handle_left_member_message error: {e}")
+
+
+def _handle_driver_confirm(chat_id: str, message: dict) -> None:
+    """/confirm — driver confirms they are the correct person in this group."""
+    from database import get_truck_by_group, set_truck_group_verified, log_driver_group_event
+    truck = get_truck_by_group(chat_id)
+    if not truck:
+        return
+    vname  = truck["vehicle_name"]
+    sender = message.get("from", {})
+    uname  = sender.get("first_name", "Driver") + (" " + sender.get("last_name", "")).rstrip()
+    set_truck_group_verified(vname, True)
+    log_driver_group_event(vname, "verified", chat_id, uname, "realtime")
+    _send_to(chat_id, f"✅ Confirmed. Fuel alerts are active for Truck *{vname}*.")
+    _send_to(ADMIN_CHAT_ID,
+        f"✅ *Truck {vname}* — {uname} driver confirmed — alerts resumed"
+    )
+
+
+def _handle_driver_wrong(chat_id: str, message: dict) -> None:
+    """/wrong — person in group is not the assigned driver."""
+    from database import get_truck_by_group, set_truck_alert_paused, log_driver_group_event
+    truck = get_truck_by_group(chat_id)
+    if not truck:
+        return
+    vname = truck["vehicle_name"]
+    set_truck_alert_paused(vname, True, "wrong_driver", group_verified=False)
+    log_driver_group_event(vname, "deactivated", chat_id, detected_by="realtime")
+    _send_to(chat_id, "⛔ Understood. Alerts paused. Admin has been notified.")
+    _send_to(ADMIN_CHAT_ID,
+        f"⚠️ *Truck {vname} — Wrong driver in group*\n"
+        f"Group: `{chat_id}`\nAlerts: PAUSED ⏸\n"
+        f"Action needed: `/assigndriver {vname} NAME {chat_id}`"
+    )
+
+
+# -- Layer 2: heartbeat group verification ------------------------------------
+
+def verify_driver_groups() -> None:
+    """Check every active truck's Telegram group — pause alerts if group is empty or bot was kicked.
+    Called from a background thread in main.py every 6 hours.
+
+    FIX (2026-05-08): Previously treated ANY failed API call (network error, rate limit,
+    Telegram 5xx) as a bot-kick, causing mass false-positive alerts on restart.
+    Now uses raw HTTP so we can inspect the actual error_code:
+      - 403 Forbidden  → bot was genuinely kicked — pause + alert
+      - anything else  → transient error — skip silently, do NOT pause alerts
+    Also adds 0.3s sleep between calls to avoid triggering rate limits on large fleets.
+    """
+    from database import get_all_registered_trucks, set_truck_alert_paused, log_driver_group_event
+    trucks = get_all_registered_trucks()
+    log.info(f"verify_driver_groups: checking {len(trucks)} trucks")
+    real_kicks = []   # (vname, gid) — confirmed 403 only
+
+    for truck in trucks:
+        vname = truck["vehicle_name"]
+        gid   = truck.get("telegram_group_id")
+        if not gid:
+            continue
+        try:
+            # Raw request — we need the JSON body even on 4xx to read error_code.
+            # _post() would swallow 4xx into None, making 403 indistinguishable from
+            # a network timeout or a 429 rate-limit error.
+            resp = requests.post(
+                f"{BASE_URL}/getChatMemberCount",
+                json={"chat_id": gid},
+                timeout=10,
+            )
+            data = resp.json()
+
+            if not data.get("ok"):
+                error_code = data.get("error_code", 0)
+                description = data.get("description", "unknown error")
+
+                if error_code == 403:
+                    # Confirmed: bot was actually kicked or banned from this group
+                    set_truck_alert_paused(vname, True, "bot_kicked", group_verified=False)
+                    log_driver_group_event(vname, "deactivated", gid, detected_by="heartbeat")
+                    real_kicks.append((vname, gid))
+                    log.warning(f"verify_driver_groups: {vname} — bot kicked (403): {description}")
+                else:
+                    # Transient error (400 bad request, 429 rate limit, 500 server error, etc.)
+                    # Do NOT pause alerts — this is not a real kick.
+                    log.warning(
+                        f"verify_driver_groups: transient error for {vname} "
+                        f"(code={error_code}, desc={description}) — skipping, alerts unchanged"
+                    )
+                time.sleep(0.3)   # rate-limit safety
+                continue
+
+            count = data.get("result", 0)
+            if count < 2:
+                set_truck_alert_paused(vname, True, "group_empty", group_verified=False)
+                log_driver_group_event(vname, "deactivated", gid, detected_by="heartbeat")
+                _send_to(ADMIN_CHAT_ID,
+                    f"⚠️ *Truck {vname} group is empty — alerts paused*\n"
+                    f"Group: `{gid}`  Members: {count}"
+                )
+
+        except Exception as e:
+            log.warning(f"verify_driver_groups: skipping {vname}: {e}")
+
+        time.sleep(0.3)   # rate-limit safety between every group check
+
+    # Send one alert per genuinely kicked truck (only fires for real 403s)
+    for vname, gid in real_kicks:
+        _send_to(ADMIN_CHAT_ID,
+            f"🚨 *Bot removed from Truck {vname} group — alerts stopped*\n"
+            f"Group: `{gid}`\n"
+            f"To reassign: `/assigndriver {vname} NAME {gid}`"
+        )
+    log.info(f"verify_driver_groups: done — {len(real_kicks)} real kicks, "
+             f"{len([t for t in trucks if t.get('telegram_group_id')])} groups checked")
+
+
+# -- Layer 3: admin driver management commands --------------------------------
+
+def _handle_assigndriver(text: str) -> None:
+    """/assigndriver <vehicle_name_or_number> <driver_name...> <group_id>"""
+    from database import assign_driver, log_driver_group_event, resolve_truck_by_number
+    parts = text.strip().split()
+    # Minimum: /assigndriver TRUCK FIRSTNAME GROUP_ID  → 4 tokens
+    if len(parts) < 4:
+        _send_to(ADMIN_CHAT_ID,
+            "Usage: `/assigndriver 0792 John Smith -1001234567890`\n"
+            "Last argument must be the Telegram group ID."
+        )
+        return
+    token    = parts[1]
+    group_id = parts[-1]
+    dname    = " ".join(parts[2:-1])
+
+    vname = resolve_truck_by_number(token)
+    if not vname:
+        _send_to(ADMIN_CHAT_ID, f"❌ Truck `{token}` not found in DB.")
+        return
+
+    assign_driver(vname, dname, group_id, assigned_by="admin")
+    log_driver_group_event(vname, "reassigned", group_id, dname, "admin")
+
+    # Send verification message to the new group
+    _send_to(group_id,
+        f"👋 *DieselUp Bot here.* {dname} has been assigned to Truck *{vname}*.\n"
+        f"Reply /confirm to activate fuel alerts.\n"
+        f"If you're not the driver, reply /wrong"
+    )
+    _send_to(ADMIN_CHAT_ID,
+        f"✅ *Truck {vname}* reassigned to *{dname}* — verification sent to group `{group_id}`"
+    )
+
+
+def _handle_removedriver(text: str) -> None:
+    """/removedriver <vehicle_name_or_number>"""
+    from database import remove_driver, log_driver_group_event, resolve_truck_by_number
+    parts = text.strip().split()
+    if len(parts) < 2:
+        _send_to(ADMIN_CHAT_ID, "Usage: `/removedriver 0792`")
+        return
+    vname = resolve_truck_by_number(parts[1])
+    if not vname:
+        _send_to(ADMIN_CHAT_ID, f"❌ Truck `{parts[1]}` not found in DB.")
+        return
+    remove_driver(vname)
+    log_driver_group_event(vname, "deactivated", detected_by="admin")
+    _send_to(ADMIN_CHAT_ID, f"✅ *Truck {vname}* alerts paused — no active driver")
+
+
+def _handle_whodrives(text: str) -> None:
+    """/whodrives <vehicle_name_or_number>"""
+    from database import get_active_driver, get_truck_config, resolve_truck_by_number
+    from datetime import datetime, timezone
+    parts = text.strip().split()
+    if len(parts) < 2:
+        _send_to(ADMIN_CHAT_ID, "Usage: `/whodrives 0792`")
+        return
+    vname = resolve_truck_by_number(parts[1])
+    if not vname:
+        _send_to(ADMIN_CHAT_ID, f"❌ Truck `{parts[1]}` not found in DB.")
+        return
+
+    cfg    = get_truck_config(vname) or {}
+    driver = get_active_driver(vname)
+
+    dname   = driver["driver_name"] if driver else "None assigned"
+    gid     = cfg.get("telegram_group_id") or "—"
+    paused  = cfg.get("alert_paused", False)
+    reason  = cfg.get("pause_reason") or ""
+    verified = cfg.get("group_verified", False)
+    alert_s  = "Active ✅" if not paused else f"Paused ⏸ ({reason})"
+    ver_s    = "✅ Verified" if verified else "❌ Unverified"
+
+    lines = [
+        f"🚛 *Truck {vname}*",
+        f"Driver: {dname}",
+        f"Group: `{gid}`",
+        f"Verified: {ver_s}",
+        f"Alerts: {alert_s}",
+    ]
+    if driver and driver.get("assigned_at"):
+        ts = driver["assigned_at"]
+        if hasattr(ts, "strftime"):
+            lines.append(f"Assigned: {ts.strftime('%b %d %H:%M UTC')}")
+    _send_to(ADMIN_CHAT_ID, "\n".join(lines))
+
+
+def _handle_driverlog(text: str) -> None:
+    """/driverlog <vehicle_name_or_number> — show last 10 driver group events."""
+    from database import get_driver_event_log, resolve_truck_by_number
+    parts = text.strip().split()
+    if len(parts) < 2:
+        _send_to(ADMIN_CHAT_ID, "Usage: `/driverlog 0792`")
+        return
+    vname = resolve_truck_by_number(parts[1])
+    if not vname:
+        _send_to(ADMIN_CHAT_ID, f"❌ Truck `{parts[1]}` not found.")
+        return
+
+    events = get_driver_event_log(vname, limit=10)
+    if not events:
+        _send_to(ADMIN_CHAT_ID, f"No events logged for *{vname}* yet.")
+        return
+
+    lines = [f"📋 *Driver log — Truck {vname}* (last {len(events)})"]
+    for e in events:
+        ts  = e["created_at"]
+        tss = ts.strftime("%b %d %H:%M") if hasattr(ts, "strftime") else str(ts)
+        dby = e.get("detected_by") or "?"
+        drv = e.get("driver_name") or ""
+        lines.append(f"`{tss}` *{e['event_type']}* via {dby}{' — ' + drv if drv else ''}")
+    _send_to(ADMIN_CHAT_ID, "\n".join(lines))
+
+
+def _handle_driverlist() -> None:
+    """/driverlist — all active trucks with driver and alert status."""
+    from database import get_all_driver_statuses
+    rows = get_all_driver_statuses()
+    if not rows:
+        _send_to(ADMIN_CHAT_ID, "No active trucks found.")
+        return
+    lines = [f"🚛 *Driver List ({len(rows)} trucks)*\n"]
+    for r in rows:
+        vname   = r["vehicle_name"]
+        dname   = r.get("driver_name") or "—"
+        paused  = r.get("alert_paused", False)
+        ver     = r.get("group_verified", False)
+        a_icon  = "🟢" if not paused else "🔴"
+        v_icon  = "✅" if ver else "❌"
+        lines.append(f"{a_icon} *{vname}* | {dname} | {v_icon}")
+    # Send in chunks to avoid Telegram message length limit
+    chunks = [lines[0:1] + lines[i:i+50] for i in range(1, len(lines), 50)]
+    for chunk in chunks:
+        _send_to(ADMIN_CHAT_ID, "\n".join(chunk))
+
+
+def _handle_alertcount() -> None:
+    """/alertcount — show how many drivers are actively receiving fuel alerts, broken down by system."""
+    from database import get_alert_count_by_system
+    try:
+        data = get_alert_count_by_system()
+        old  = data.get('old', {})
+        new  = data.get('new', {})
+
+        total_active = old.get('active', 0) + new.get('active', 0)
+        total_trucks = old.get('total', 0)  + new.get('total', 0)
+
+        lines = [f"📊 *Alert Recipients — {total_active}/{total_trucks} drivers active*\n"]
+
+        lines.append("*🟡 Old System (EFS/WEX card):*")
+        lines.append(f"  Total trucks:       {old.get('total', 0)}")
+        lines.append(f"  ✅ Receiving alerts: {old.get('active', 0)}")
+        lines.append(f"  📱 Has group set:    {old.get('with_group', 0)}")
+        lines.append(f"  🔕 Paused:           {old.get('paused', 0)}")
+        lines.append("")
+
+        lines.append("*🟢 New System (Relay — Pilot/Flying J):*")
+        lines.append(f"  Total trucks:       {new.get('total', 0)}")
+        lines.append(f"  ✅ Receiving alerts: {new.get('active', 0)}")
+        lines.append(f"  📱 Has group set:    {new.get('with_group', 0)}")
+        lines.append(f"  🔕 Paused:           {new.get('paused', 0)}")
+        lines.append("")
+
+        lines.append("_Use /driverlist for per-truck detail._")
+
+        _send_to(ADMIN_CHAT_ID, "\n".join(lines))
+    except Exception as e:
+        log.error(f"/alertcount error: {e}", exc_info=True)
+        _send_to(ADMIN_CHAT_ID, f"❌ Error: `{e}`")
+
+
+def _handle_resumeall() -> None:
+    """/resumeall — un-pause all trucks that were paused by the heartbeat false-positive (bot_kicked reason only)."""
+    from database import bulk_resume_bot_kicked
+    try:
+        count = bulk_resume_bot_kicked()
+        if count == 0:
+            _send_to(ADMIN_CHAT_ID,
+                "✅ No trucks were paused with reason `bot_kicked` — nothing to resume.\n"
+                "_(If trucks are paused for other reasons use /driverlist to check.)_"
+            )
+        else:
+            _send_to(ADMIN_CHAT_ID,
+                f"✅ *{count} truck(s) resumed* — fuel alerts reactivated fleet-wide.\n"
+                f"_(Only trucks paused by the heartbeat false-positive were affected.)_\n"
+                f"Use /alertcount to confirm active count."
+            )
+        log.info(f"/resumeall: resumed {count} trucks from bot_kicked pause")
+    except Exception as e:
+        log.error(f"/resumeall error: {e}", exc_info=True)
+        _send_to(ADMIN_CHAT_ID, f"❌ /resumeall failed: `{e}`")
+
+
+def _handle_relayapp(chat_id: str) -> None:
+    """/relayapp — move all trucks in this group to new Relay fuel card (Pilot/FJ only)."""
+    from database import set_group_card_system, db_cursor
+    try:
+        names = set_group_card_system(chat_id, 'new')
+        if not names:
+            _send_to(chat_id,
+                "❌ No trucks found for this group.\n"
+                "Ask admin to assign trucks first with /setgroup.")
+            return
+        truck_list = ", ".join(names)
+        _send_to(chat_id,
+            f"✅ All trucks in this group have been moved to the new Relay fuel card.\n"
+            f"From now on, fuel stops will be *Pilot and Flying J only*.\n\n"
+            f"Trucks updated: {truck_list}")
+        # Get group name for admin notification
+        with db_cursor() as cur:
+            cur.execute(
+                "SELECT telegram_group_name FROM trucks WHERE telegram_group_id = %s LIMIT 1",
+                (str(chat_id),)
+            )
+            row = cur.fetchone()
+            group_name = (row["telegram_group_name"] or chat_id) if row else chat_id
+        _send_to(ADMIN_CHAT_ID,
+            f"🔄 *Group moved to Relay system*\n"
+            f"Group: *{group_name}*\n"
+            f"Trucks ({len(names)}): {truck_list}")
+        log.info(f"/relayapp: group {chat_id} moved {len(names)} trucks to new system: {truck_list}")
+    except Exception as e:
+        log.error(f"/relayapp error: {e}", exc_info=True)
+        _send_to(chat_id, f"❌ Error switching to new system: `{e}`")

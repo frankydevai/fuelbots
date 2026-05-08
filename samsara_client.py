@@ -207,21 +207,57 @@ def get_vehicle_fuel_efficiency(vehicle_id: str = None) -> dict:
             logging.getLogger(__name__).warning(f"Samsara fuel report: {resp.status_code} {resp.text[:200]}")
             return {}
 
-        data    = resp.json().get("data", [])
+        payload = resp.json()
+        data    = payload.get("data", [])
+        if not data:
+            import logging as _log
+            _log.getLogger(__name__).warning(
+                f"Samsara fuel report: empty data. Keys in response: {list(payload.keys())}"
+            )
+            return {}
         results = {}
         for v in data:
-            vid        = v.get("id") or v.get("vehicleId", "")
-            stats      = v.get("stats") or v.get("fuelAndEnergyStats") or {}
-            mpg        = stats.get("mpg") or stats.get("fuelEfficiencyMpg") or 0
-            idle_hours = stats.get("idleTimeHours") or stats.get("idleHours") or 0
-            idle_pct   = stats.get("idleTimePercent") or stats.get("idlePercent") or 0
-            fuel_gal   = stats.get("fuelUsedGallons") or stats.get("totalFuelUsedGallons") or 0
+            vid  = v.get("id") or v.get("vehicleId", "")
+            name = v.get("name", "")
+            # Try every known field layout Samsara uses across API versions
+            stats = (
+                v.get("fuelAndEnergyStats") or
+                v.get("stats") or
+                v.get("fuelEnergyStats") or
+                v  # fallback: fields may be at top level
+            )
+            mpg = (
+                stats.get("fuelEfficiencyMpg") or
+                stats.get("mpg") or
+                stats.get("fuelEfficiency") or
+                0
+            )
+            idle_hours = (
+                stats.get("idleTimeHours") or
+                stats.get("idleHours") or
+                stats.get("engineIdleTimeHours") or
+                0
+            )
+            idle_pct = (
+                stats.get("idleTimePercent") or
+                stats.get("idlePercent") or
+                stats.get("engineIdlePercent") or
+                0
+            )
+            fuel_gal = (
+                stats.get("fuelConsumptionGallons") or
+                stats.get("fuelUsedGallons") or
+                stats.get("totalFuelUsedGallons") or
+                stats.get("totalFuelConsumedGallons") or
+                0
+            )
             if vid:
                 results[vid] = {
                     "mpg":        round(float(mpg), 2) if mpg else 0,
                     "idle_hours": round(float(idle_hours), 1) if idle_hours else 0,
                     "idle_pct":   round(float(idle_pct), 1) if idle_pct else 0,
                     "fuel_gal":   round(float(fuel_gal), 1) if fuel_gal else 0,
+                    "name":       name,
                 }
         return results
     except Exception as e:
