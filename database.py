@@ -942,9 +942,14 @@ def _read_excel_rows(file_bytes: bytes) -> tuple[list[str], list[list], str | No
             )
             ws = wb.active
             rows_iter = iter(ws.iter_rows(values_only=True))
-            header_row = next(rows_iter, None)
+            header_row = None
+            for row in rows_iter:
+                valid_cells = [str(c).strip() for c in row if c is not None and str(c).strip()]
+                if len(valid_cells) >= 3:
+                    header_row = row
+                    break
             if not header_row:
-                return [], [], "xlsx file has no header row"
+                return [], [], "xlsx file has no valid header row"
             headers = [str(h or "").strip().lower() for h in header_row]
             data_rows = [list(r) for r in rows_iter]
             return headers, data_rows, None
@@ -965,12 +970,22 @@ def _read_excel_rows(file_bytes: bytes) -> tuple[list[str], list[list], str | No
             sheet = book.sheet_by_index(0)
             if sheet.nrows < 1:
                 return [], [], "xls sheet is empty"
-            headers = [
-                str(sheet.cell_value(0, c) or "").strip().lower()
-                for c in range(sheet.ncols)
-            ]
+            
+            header_row_idx = -1
+            headers = []
+            for r in range(sheet.nrows):
+                row = [sheet.cell_value(r, c) for c in range(sheet.ncols)]
+                valid_cells = [str(c).strip() for c in row if c is not None and str(c).strip()]
+                if len(valid_cells) >= 3:
+                    header_row_idx = r
+                    headers = [str(c or "").strip().lower() for c in row]
+                    break
+                    
+            if header_row_idx == -1:
+                return [], [], "xls sheet has no valid header row"
+                
             data_rows = []
-            for r in range(1, sheet.nrows):
+            for r in range(header_row_idx + 1, sheet.nrows):
                 row = [sheet.cell_value(r, c) for c in range(sheet.ncols)]
                 data_rows.append(row)
             return headers, data_rows, None
@@ -1011,8 +1026,20 @@ def _read_excel_rows(file_bytes: bytes) -> tuple[list[str], list[list], str | No
             p.feed(text)
             if not p.rows:
                 return [], [], "html-style xls had no <table> rows"
-            headers = [str(h or "").strip().lower() for h in p.rows[0]]
-            return headers, [list(r) for r in p.rows[1:]], None
+                
+            header_row_idx = -1
+            headers = []
+            for i, row in enumerate(p.rows):
+                valid_cells = [str(c).strip() for c in row if c is not None and str(c).strip()]
+                if len(valid_cells) >= 3:
+                    header_row_idx = i
+                    headers = [str(c or "").strip().lower() for c in row]
+                    break
+                    
+            if header_row_idx == -1:
+                return [], [], "html-style xls has no valid header row"
+                
+            return headers, [list(r) for r in p.rows[header_row_idx + 1:]], None
         except Exception as e:
             return [], [], f"html-style xls parse error: {e}"
 
