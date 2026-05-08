@@ -497,6 +497,9 @@ def poll_for_uploads():
             elif text.startswith("/relayapp"):
                 _handle_relayapp(chat_id)
                 continue
+            elif text.startswith("/cityfuel"):
+                _handle_cityfuel(chat_id)
+                continue
             elif text.startswith("/planroute"):
                 try:
                     _handle_planroute(text, chat_id)
@@ -530,6 +533,7 @@ def poll_for_uploads():
                     elif text.startswith("/routelist"):       _handle_routelist(chat_id)
                     elif text.startswith("/classify_truck"):  _handle_classify_truck(text, chat_id)
                     elif text.startswith("/setnewsystem"):    _handle_setnewsystem(text)
+                    elif text.startswith("/setoldsystem"):    _handle_setoldsystem(text)
                     elif text.startswith("/weeklyreport"):    _handle_weeklyreport()
                     elif text.startswith("/dedupetrucks"):    _handle_dedupetrucks()
                     elif text.startswith("/syncsamsara"):     _handle_syncsamsara(text)
@@ -547,6 +551,7 @@ def poll_for_uploads():
                             "/setgroup Unit4821 -100123456\n"
                             "/listtruck\n/removetruck Unit4821\n"
                             "/setnewsystem 0801 0802  — move trucks to Relay card\n"
+                            "/setoldsystem 0801 0802  — move trucks back to old EFS card\n"
                             "/alertcount  — how many drivers receiving alerts (by system)\n"
                             "/weeklyreport  — resend weekly Excel reports now\n"
                             "/findstop 0792  — any group\n"
@@ -563,6 +568,7 @@ def poll_for_uploads():
                             "/resumeall  — restore alerts paused by heartbeat false-positive\n"
                             "\nIn driver groups:\n"
                             "/relayapp  — move group trucks to new Relay card\n"
+                            "/cityfuel  — move group trucks back to old EFS card\n"
                             "/planroute 0792  — full fuel plan (works in any group)\n"
                             "/confirm  — driver confirms assignment\n"
                             "/wrong  — wrong driver in group"
@@ -2236,6 +2242,91 @@ def _handle_setnewsystem(text: str) -> None:
     _send_to(ADMIN_CHAT_ID, "\n\n".join(lines) or "No trucks updated.")
 
 
+def _handle_setoldsystem(text: str) -> None:
+    """/setoldsystem <truck1> [truck2 ...] — move trucks back to old EFS card (all stops).
+    Auto-registers trucks from Samsara if they aren't in the DB yet.
+    """
+    from database import set_truck_card_system, auto_register_truck, get_all_registered_trucks
+    raw = text.strip()
+    after_cmd = raw.split(None, 1)[1] if len(raw.split()) > 1 else ""
+    if not after_cmd:
+        _send_to(ADMIN_CHAT_ID, "Usage: `/setoldsystem all` or `/setoldsystem 1079 1190 1655`")
+        return
+
+    # /setoldsystem all — move every active truck at once
+    if after_cmd.strip().lower() == "all":
+        trucks = get_all_registered_trucks()
+        count = 0
+        for t in trucks:
+            if set_truck_card_system(t["vehicle_name"], 'old'):
+                count += 1
+        _send_to(ADMIN_CHAT_ID,
+            f"✅ *All trucks moved back to old EFS card (all stops)*\n"
+            f"{len(trucks)} trucks updated.")
+        return
+
+    tokens = [t.strip().strip(",") for t in after_cmd.replace(",", " ").split() if t.strip().strip(",")]
+    tokens = list(dict.fromkeys(tokens))  # deduplicate, preserve order
+
+    moved_full  = []  # actual DB names successfully updated
+    registered  = []  # trucks auto-registered from Samsara then moved
+    not_found   = []  # not in DB and not in Samsara
+
+    # Build Samsara lookup once for auto-registration of missing trucks
+    samsara_map = {}  # partial_number -> vehicle_name as stored in Samsara
+    try:
+        from samsara_client import get_combined_vehicle_data
+        vehicles = get_combined_vehicle_data()
+        for v in vehicles:
+            vname = v.get("vehicle_name", "")
+            vid   = v.get("vehicle_id", "")
+            samsara_map[vname] = (vname, vid)
+    except Exception:
+        pass  # Samsara unavailable — only DB matching will work
+
+    for token in tokens:
+        matched = set_truck_card_system(token, 'old')
+        if matched:
+            moved_full.extend(matched)
+            continue
+
+        # Not in DB — try to find in Samsara by number prefix and auto-register
+        samsara_match = next(
+            ((vname, vid) for vname, vid in samsara_map.values()
+             if vname == token
+             or vname.startswith(token + ' ')
+             or vname.startswith(token + '-')),
+            None
+        )
+        if samsara_match:
+            s_name, s_vid = samsara_match
+            try:
+                auto_register_truck(s_vid, s_name)
+                # Now set card system on the newly registered truck
+                matched2 = set_truck_card_system(token, 'old')
+                if matched2:
+                    registered.extend(matched2)
+                    continue
+            except Exception as e:
+                log.warning(f"Auto-register failed for {token}: {e}")
+
+        not_found.append(token)
+
+    lines = []
+    all_moved = moved_full + registered
+    if all_moved:
+        truck_list = "\n".join(f"  • {n}" for n in all_moved)
+        lines.append(f"✅ *Moved back to old EFS card (all stops):*\n{truck_list}")
+    if registered:
+        lines.append(f"_({len(registered)} auto-registered from Samsara)_")
+    if not_found:
+        lines.append(
+            f"❌ *Not found in DB or Samsara:* " + ", ".join(f"`{n}`" for n in not_found) +
+            f"\nCheck truck numbers or run `/listtruck` to see registered names."
+        )
+    _send_to(ADMIN_CHAT_ID, "\n\n".join(lines) or "No trucks updated.")
+
+
 # -- Driver group change detection handlers -----------------------------------
 
 def _handle_chat_member_event(evt: dict) -> None:
@@ -2676,3 +2767,36 @@ def _handle_relayapp(chat_id: str) -> None:
     except Exception as e:
         log.error(f"/relayapp error: {e}", exc_info=True)
         _send_to(chat_id, f"❌ Error switching to new system: `{e}`")
+
+
+def _handle_cityfuel(chat_id: str) -> None:
+    """/cityfuel — move all trucks in this group back to old EFS fuel card (all stops)."""
+    from database import set_group_card_system, db_cursor
+    try:
+        names = set_group_card_system(chat_id, 'old')
+        if not names:
+            _send_to(chat_id,
+                "❌ No trucks found for this group.\n"
+                "Ask admin to assign trucks first with /setgroup.")
+            return
+        truck_list = ", ".join(names)
+        _send_to(chat_id,
+            f"✅ All trucks in this group have been moved back to the old EFS fuel card.\n"
+            f"From now on, fuel stops will be calculated across *all available networks*.\n\n"
+            f"Trucks updated: {truck_list}")
+        # Get group name for admin notification
+        with db_cursor() as cur:
+            cur.execute(
+                "SELECT telegram_group_name FROM trucks WHERE telegram_group_id = %s LIMIT 1",
+                (str(chat_id),)
+            )
+            row = cur.fetchone()
+            group_name = (row["telegram_group_name"] or chat_id) if row else chat_id
+        _send_to(ADMIN_CHAT_ID,
+            f"🔄 *Group moved back to old EFS system*\n"
+            f"Group: *{group_name}*\n"
+            f"Trucks ({len(names)}): {truck_list}")
+        log.info(f"/cityfuel: group {chat_id} moved {len(names)} trucks to old system: {truck_list}")
+    except Exception as e:
+        log.error(f"/cityfuel error: {e}", exc_info=True)
+        _send_to(chat_id, f"❌ Error switching to old system: `{e}`")
