@@ -161,15 +161,10 @@ def _search_trips(page_size: int = 100) -> list[dict]:
 
     # Try filtering by active statuses directly
     endpoints = [
-        # Filter by in_transit status
+        # Filter by active statuses only — "upcoming" excluded so we don't early-return on non-active trips
         ("POST", f"{QM_BASE_URL}/x/trips/search", {
             "query": "", "page": 0, "page_size": page_size,
-            "filters": [{"field": "status", "operator": "in", "value": ["in_transit", "dispatched", "upcoming"]}]
-        }),
-        # Filter by in_transit only
-        ("POST", f"{QM_BASE_URL}/x/trips/search", {
-            "query": "", "page": 0, "page_size": page_size,
-            "filters": [{"field": "status", "operator": "eq", "value": "in_transit"}]
+            "filters": [{"field": "status", "operator": "in", "value": ["in_transit", "dispatched"]}]
         }),
         # No filter — get all and filter client side
         ("POST", f"{QM_BASE_URL}/x/trips/search", {"query": "", "filters": [], "page": 0, "page_size": page_size}),
@@ -213,17 +208,21 @@ def _build_route(trip: dict, truck_number: str) -> dict | None:
         return None
 
     status = trip.get("status", "").lower()
-    stops  = []
 
-    for s in stops_raw:
+    # Only geocode origin and destination — geocoding all stops is expensive
+    # and only the first/last coordinates are used for routing.
+    origin_raw = stops_raw[0]
+    dest_raw   = stops_raw[-1]
+    origin_coords = _stop_coords(origin_raw)
+    dest_coords   = _stop_coords(dest_raw)
+
+    def _stop_meta(s, coords):
         addr  = s.get("address") or {}
         city  = addr.get("city", "").strip()
         state = addr.get("state", "").strip()
         zip_  = addr.get("zip_code", "").strip()
         line1 = addr.get("address_line_1", "").strip()
-        coords = _stop_coords(s)
-
-        stops.append({
+        return {
             "pickup":       bool(s.get("pickup")),
             "company_name": s.get("company_name", ""),
             "address":      line1,
@@ -233,7 +232,17 @@ def _build_route(trip: dict, truck_number: str) -> dict | None:
             "lat":          coords[0] if coords else None,
             "lng":          coords[1] if coords else None,
             "appt":         s.get("appointment_date", ""),
-        })
+        }
+
+    # Build minimal stop list: geocoded origin + destination, rest without coords
+    stops = []
+    for i, s in enumerate(stops_raw):
+        if i == 0:
+            stops.append(_stop_meta(s, origin_coords))
+        elif i == len(stops_raw) - 1:
+            stops.append(_stop_meta(s, dest_coords))
+        else:
+            stops.append(_stop_meta(s, None))
 
     # ── Strict Origin / Destination Assignment ──────────────────────────────
     # Origin  = FIRST stop in the array (pickup)
@@ -314,15 +323,27 @@ def get_all_truck_routes() -> dict[str, dict]:
     routes = {}
     for trip in active:
         stops = trip.get("stops") or []
-        # Find truck number — check all stops
+        # Find truck number — check trip-level first, then stops
         truck_number = None
-        for stop in stops:
-            truck = stop.get("assigned_truck") or {}
-            num   = str(truck.get("number", "")).strip()
-            if num and truck.get("id") != "00000000-0000-0000-0000-000000000000":
-                truck_number = num
+        for field in ("truck_number", "truck_num"):
+            val = str(trip.get(field) or "").strip()
+            if val and val != "0":
+                truck_number = val
                 break
         if not truck_number:
+            t = trip.get("truck") or trip.get("assigned_truck") or {}
+            val = str(t.get("number") or t.get("truck_number") or "").strip()
+            if val and t.get("id") != "00000000-0000-0000-0000-000000000000":
+                truck_number = val
+        if not truck_number:
+            for stop in stops:
+                truck = stop.get("assigned_truck") or {}
+                num   = str(truck.get("number", "")).strip()
+                if num and truck.get("id") != "00000000-0000-0000-0000-000000000000":
+                    truck_number = num
+                    break
+        if not truck_number:
+            log.debug(f"Trip {trip.get('trip_num')}: no truck number found — skipping")
             continue
 
         route = _build_route(trip, truck_number)

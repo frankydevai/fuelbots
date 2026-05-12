@@ -2,8 +2,12 @@
 samsara_client.py  -  Fetch vehicle locations and fuel levels from Samsara API.
 """
 
+import logging
 import requests
+from datetime import datetime, timezone, timedelta
 from config import SAMSARA_API_TOKEN, SAMSARA_BASE_URL
+
+log = logging.getLogger(__name__)
 
 HEADERS = {
     "Authorization": f"Bearer {SAMSARA_API_TOKEN}",
@@ -19,41 +23,62 @@ def _get(endpoint: str, params: dict = None) -> dict:
 
 
 def get_vehicle_locations() -> list[dict]:
-    """Fetch current vehicle locations from Samsara."""
-    url  = "https://api.samsara.com/fleet/vehicles/locations"
-    resp = requests.get(url, headers=HEADERS, timeout=15)
-    resp.raise_for_status()
-    data = resp.json().get("data", [])
-    # Log any trucks with stale locations (>2 hours old)
-    import logging
-    log = logging.getLogger(__name__)
-    from datetime import datetime, timezone, timedelta
-    now = datetime.now(timezone.utc)
+    """Fetch current vehicle locations from Samsara, following cursor pagination."""
+    url    = "https://api.samsara.com/fleet/vehicles/locations"
+    params = {}
+    all_vehicles: list[dict] = []
+
+    while True:
+        resp = requests.get(url, headers=HEADERS, params=params, timeout=15)
+        resp.raise_for_status()
+        payload = resp.json()
+        all_vehicles.extend(payload.get("data", []))
+        pagination = payload.get("pagination", {})
+        if not pagination.get("hasNextPage"):
+            break
+        params["after"] = pagination["endCursor"]
+
+    now   = datetime.now(timezone.utc)
     fresh = []
-    for v in data:
+    for v in all_vehicles:
         loc = v.get("location", {})
         ts  = loc.get("time", "")
         if ts:
             try:
-                t = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                t       = datetime.fromisoformat(ts.replace("Z", "+00:00"))
                 age_min = (now - t).total_seconds() / 60
                 if age_min > 120:
-                    log.warning(f"Truck {v.get('name')} GPS stale: {age_min:.0f} min old ({loc.get('reverseGeo',{}).get('formattedLocation','')})")
-                    continue  # skip stale trucks — don't alert on bad data
+                    log.warning(
+                        f"Truck {v.get('name')} GPS stale: {age_min:.0f} min old "
+                        f"({loc.get('reverseGeo',{}).get('formattedLocation','')})"
+                    )
             except Exception:
                 pass
         fresh.append(v)
-    log.info(f"Samsara: {len(data)} trucks total, {len(fresh)} with fresh GPS")
+
+    log.info(f"Samsara: {len(all_vehicles)} trucks fetched (all pages)")
     return fresh
 
 
 def get_vehicle_stats() -> list[dict]:
-    """Fetch current fuel levels using stats/feed — returns latest value per vehicle."""
-    url    = "https://api.samsara.com/fleet/vehicles/stats/feed"
-    params = {"types": "fuelPercents"}
-    resp   = requests.get(url, headers=HEADERS, params=params, timeout=15)
-    resp.raise_for_status()
-    return resp.json().get("data", [])
+    """Fetch current fuel levels using stats/feed — follows cursor pagination."""
+    url      = "https://api.samsara.com/fleet/vehicles/stats/feed"
+    params   = {"types": "fuelPercents"}
+    all_data: list[dict] = []
+
+    while True:
+        resp = requests.get(url, headers=HEADERS, params=params, timeout=15)
+        resp.raise_for_status()
+        payload = resp.json()
+        all_data.extend(payload.get("data", []))
+        pagination = payload.get("pagination", {})
+        if not pagination.get("hasNextPage"):
+            break
+        # Stats feed uses "after" for the cursor key (same as locations endpoint)
+        params["after"] = pagination["endCursor"]
+
+    log.info(f"Samsara stats: {len(all_data)} vehicles with fuel data (all pages)")
+    return all_data
 
 
 def get_driver_for_vehicle(vehicle_id: str) -> dict | None:
@@ -72,7 +97,6 @@ def get_combined_vehicle_data() -> list[dict]:
     Returns list of dicts with: vehicle_id, vehicle_name, lat, lng,
     heading, speed_mph, fuel_pct, gps_stale, gps_age_minutes.
     """
-    from datetime import datetime, timezone
     locations_raw = get_vehicle_locations()
     stats_raw     = get_vehicle_stats()
 
@@ -105,6 +129,7 @@ def get_combined_vehicle_data() -> list[dict]:
         lng  = loc.get("longitude")
 
         if lat is None or lng is None:
+            log.warning(f"Truck {name} ({vid}): no GPS coordinates — skipped")
             continue
 
         # Compute GPS age for stale-location warning
@@ -117,13 +142,10 @@ def get_combined_vehicle_data() -> list[dict]:
             except Exception:
                 pass
 
-        driver      = get_driver_for_vehicle(vid)
-        driver_name = driver.get("name") if driver else None
-
         results.append({
             "vehicle_id":       vid,
             "vehicle_name":     name,
-            "driver_name":      driver_name,
+            "driver_name":      None,
             "lat":              float(lat),
             "lng":              float(lng),
             "heading":          float(loc.get("heading", 0)),
@@ -141,14 +163,11 @@ def get_vehicle_location_history(vehicle_id: str, hours_back: int = 1) -> list[d
     Uses Samsara /fleet/vehicles/locations/feed endpoint.
     Returns list of {lat, lng, time} sorted oldest first.
     """
-    from datetime import datetime, timezone, timedelta
-    import requests as _req
-
     end_time   = datetime.now(timezone.utc)
     start_time = end_time - timedelta(hours=hours_back)
 
     try:
-        resp = _req.get(
+        resp = requests.get(
             "https://api.samsara.com/fleet/vehicles/locations/history",
             headers=HEADERS,
             params={
@@ -173,8 +192,7 @@ def get_vehicle_location_history(vehicle_id: str, hours_back: int = 1) -> list[d
                 result.append({"lat": float(lat), "lng": float(lng), "time": ts})
         return sorted(result, key=lambda x: x["time"])
     except Exception as e:
-        import logging
-        logging.getLogger(__name__).warning(f"Location history failed for {vehicle_id}: {e}")
+        log.warning(f"Location history failed for {vehicle_id}: {e}")
         return []
 
 def get_vehicle_fuel_efficiency(vehicle_id: str = None) -> dict:
@@ -182,9 +200,6 @@ def get_vehicle_fuel_efficiency(vehicle_id: str = None) -> dict:
     Fetch real MPG and idle data from Samsara Fuel & Energy report.
     Returns dict of vehicle_id -> {mpg, idle_hours, idle_pct, fuel_used_gal}
     """
-    import requests as _req
-    from datetime import datetime, timezone, timedelta
-
     end_time   = datetime.now(timezone.utc)
     start_time = end_time - timedelta(days=30)
 
@@ -196,24 +211,20 @@ def get_vehicle_fuel_efficiency(vehicle_id: str = None) -> dict:
         params["vehicleIds"] = vehicle_id
 
     try:
-        resp = _req.get(
+        resp = requests.get(
             "https://api.samsara.com/fleet/reports/vehicles/fuel-energy",
             headers=HEADERS,
             params=params,
             timeout=15,
         )
         if not resp.ok:
-            import logging
-            logging.getLogger(__name__).warning(f"Samsara fuel report: {resp.status_code} {resp.text[:200]}")
+            log.warning(f"Samsara fuel report: {resp.status_code} {resp.text[:200]}")
             return {}
 
         payload = resp.json()
         data    = payload.get("data", [])
         if not data:
-            import logging as _log
-            _log.getLogger(__name__).warning(
-                f"Samsara fuel report: empty data. Keys in response: {list(payload.keys())}"
-            )
+            log.warning(f"Samsara fuel report: empty data. Keys in response: {list(payload.keys())}")
             return {}
         results = {}
         for v in data:
@@ -261,8 +272,7 @@ def get_vehicle_fuel_efficiency(vehicle_id: str = None) -> dict:
                 }
         return results
     except Exception as e:
-        import logging
-        logging.getLogger(__name__).warning(f"Samsara fuel efficiency failed: {e}")
+        log.warning(f"Samsara fuel efficiency failed: {e}")
         return {}
 
 
@@ -271,14 +281,11 @@ def get_vehicle_idle_events(vehicle_id: str, hours_back: int = 24) -> list[dict]
     Fetch idling events for a specific vehicle.
     Returns list of {start_time, duration_minutes, location}
     """
-    import requests as _req
-    from datetime import datetime, timezone, timedelta
-
     end_time   = datetime.now(timezone.utc)
     start_time = end_time - timedelta(hours=hours_back)
 
     try:
-        resp = _req.get(
+        resp = requests.get(
             "https://api.samsara.com/idling/events",
             headers=HEADERS,
             params={
@@ -302,6 +309,5 @@ def get_vehicle_idle_events(vehicle_id: str, hours_back: int = 24) -> list[dict]
             })
         return results
     except Exception as e:
-        import logging
-        logging.getLogger(__name__).warning(f"Samsara idle events failed: {e}")
+        log.warning(f"Samsara idle events failed: {e}")
         return []

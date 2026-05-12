@@ -1409,16 +1409,17 @@ def process_truck(vid, prev_state, current_data, truck_states, card_system=None)
         if state.get("open_alert_id"):
             resolve_alert(state["open_alert_id"])
 
-        stop_name = actual_name
-        send_refueled_alert(vname, stop_name, fuel,
+        send_refueled_alert(vname, actual_name, fuel,
                             truck_lat=lat, truck_lng=lng,
                             actual_stop=actual_stop)
         _clear_alert(state)
+        # Restore next planned stop after clear (clear wipes assigned_stop fields)
         if next_planned_stop:
-            state["assigned_stop_name"] = next_planned_stop.get("store_name", "Unknown")
-            state["assigned_stop_lat"]  = next_planned_stop.get("latitude")
-            state["assigned_stop_lng"]  = next_planned_stop.get("longitude")
+            state["assigned_stop_name"]       = next_planned_stop.get("store_name", "Unknown")
+            state["assigned_stop_lat"]        = next_planned_stop.get("latitude")
+            state["assigned_stop_lng"]        = next_planned_stop.get("longitude")
             state["assigned_stop_card_price"] = next_planned_stop.get("card_price") or next_planned_stop.get("diesel_price")
+            state["assigned_stop_net_price"]  = next_planned_stop.get("net_price")
         state["state"]     = "HEALTHY" if fuel > FUEL_ALERT_THRESHOLD_PCT else "WATCH"
         state["next_poll"] = _next_poll(POLL_INTERVAL_HEALTHY)
         try:

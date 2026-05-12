@@ -277,10 +277,6 @@ def classify_all_trucks() -> dict[str, str]:
         log.error("Classifier: failed to fetch vehicles from Samsara: %s", exc)
         return {}
 
-    # Pre-populate driver cache from combined-data results (driver_name already fetched there)
-    for v in vehicles:
-        _cache[f"has_driver_{v['vehicle_id']}"] = v.get("driver_name") is not None
-
     _cache["geofences"] = _get_geofences()
 
     results: dict[str, str] = {}
